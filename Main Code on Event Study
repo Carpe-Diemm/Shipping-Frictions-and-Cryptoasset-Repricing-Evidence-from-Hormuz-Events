@@ -19,8 +19,7 @@ Major design notes:
 5) Terminal output is compact and prints only decision-relevant results.
 6) No hourly-price module is included; all CARs are based on daily event windows.
 
-Important: this script contains a CoinGecko key previously provided by the user. Do not upload publicly.
-"""
+
 
 from __future__ import annotations
 
