@@ -1,0 +1,2667 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Hormuz payment/settlement repricing study — daily event-window specification only.
+
+Major design notes:
+1) Main explanatory variables are objective, pre-event measures of network/payment/settlement activity:
+   - Coin Metrics adjusted transfer value / market cap over the prior 90 days
+   - Coin Metrics active addresses / market cap over the prior 90 days
+   - Coin Metrics transaction count / market cap over the prior 90 days
+   - CoinGecko exchange turnover / market cap as broad objective fallback
+   - Optional Artemis P2P stablecoin transfer volume / market cap if ARTEMIS_API_KEY is set
+2) Manual pay-use scores and all pay_use regressions have been removed.
+3) The main asset universe has 30 non-stable cryptoassets and includes ADA.
+4) Main event design is episode-level:
+   - February blockade episode
+   - April Hormuz event cluster
+   The original 7 events are kept as robustness checks.
+5) Terminal output is compact and prints only decision-relevant results.
+6) No hourly-price module is included; all CARs are based on daily event windows.
+
+Important: this script contains a CoinGecko key previously provided by the user. Do not upload publicly.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import time
+import json
+import math
+import hashlib
+import warnings
+import contextlib
+import io
+import subprocess
+import importlib
+from pathlib import Path
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Tuple, Any
+
+warnings.filterwarnings("ignore")
+
+# =========================================================
+# Dependency bootstrap
+# =========================================================
+
+REQUIRED_PACKAGES = {
+    "pandas": "pandas",
+    "numpy": "numpy",
+    "requests": "requests",
+    "statsmodels": "statsmodels",
+}
+
+
+def ensure_package(import_name: str, pip_name: str):
+    try:
+        return importlib.import_module(import_name)
+    except ImportError:
+        print(f"[setup] installing missing package: {pip_name}")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pip_name])
+        return importlib.import_module(import_name)
+
+
+pd = ensure_package("pandas", REQUIRED_PACKAGES["pandas"])
+np = ensure_package("numpy", REQUIRED_PACKAGES["numpy"])
+requests = ensure_package("requests", REQUIRED_PACKAGES["requests"])
+smf = ensure_package("statsmodels.formula.api", REQUIRED_PACKAGES["statsmodels"])
+sm = ensure_package("statsmodels.api", REQUIRED_PACKAGES["statsmodels"])
+
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+pd.options.display.width = 260
+pd.options.display.max_columns = 180
+pd.options.display.max_rows = 220
+
+
+# =========================================================
+# Config
+# =========================================================
+
+@dataclass
+class Config:
+    start_date: datetime = field(default_factory=lambda: datetime(2025, 4, 22, tzinfo=timezone.utc))
+    end_date: datetime = field(default_factory=lambda: datetime(2026, 4, 22, tzinfo=timezone.utc))
+    effective_data_end_date: datetime = field(default_factory=lambda: datetime(2026, 4, 19, tzinfo=timezone.utc))
+
+    # Hardcoded CoinGecko API key for local use. Do not upload this file publicly.
+    coingecko_api_key: str = "CG-pKjF1WzP8j2AVSAtqEqV68C7"
+
+    coinmetrics_base_url: str = "https://community-api.coinmetrics.io/v4"
+    artemis_api_key: str = field(default_factory=lambda: os.getenv("ARTEMIS_API_KEY", "").strip())
+    artemis_base_url: str = field(default_factory=lambda: os.getenv("ARTEMIS_API_BASE", "https://api.artemis.xyz").rstrip("/"))
+    defillama_stable_base_url: str = "https://stablecoins.llama.fi"
+
+    cache_dir: str = "research_cache_objective_episode"
+    output_dir: str = "hormuz_objective_episode_outputs"
+    verbose_download_logs: bool = False
+    write_csv_outputs: bool = False
+    sleep_sec: float = 0.35
+    timeout_sec: int = 60
+    retry_waits: List[int] = field(default_factory=lambda: [3, 8, 15, 30, 45])
+
+    estimation_pre_days: int = 60
+    estimation_gap_days: int = 6
+    objective_pre_days: int = 90
+    objective_gap_days: int = 1
+
+    default_event_car_days: int = 5
+    stable_baseline_days: int = 30
+    peg_baseline_days: int = 30
+
+    # Robustness settings. These are deliberately lightweight so the same script
+    # can be run from a normal laptop after the raw data have been cached.
+    alternative_car_windows: List[int] = field(default_factory=lambda: [1, 3, 5, 10])
+    placebo_draws: int = 500
+    # Placebo timing settings. To keep the placebo exercise comparable with the
+    # baseline seven-event design, pseudo-events use the same 90-day pre-event
+    # exposure window, 60-day expected-return estimation window, and six-day
+    # estimation gap as the actual event regressions.
+    placebo_exclusion_days: int = 5
+    placebo_seed: int = 20260426
+    placebo_objective_pre_days: int = 90
+    placebo_estimation_pre_days: int = 60
+    placebo_estimation_gap_days: int = 6
+    placebo_min_candidate_gap_days: int = 0
+    placebo_chunk_size: int = 10
+    placebo_progress_every: int = 10
+
+    # Macro-control settings. The script uses multiple public sources for macro data.
+    # FRED public CSV, official Cboe VIX CSV, DataHub/EIA Brent CSV, Stooq, and
+    # yfinance are tried automatically. Local CSV loading is retained as an explicit fallback option.
+    macro_download_enabled: bool = True
+    use_local_macro_csv_fallback: bool = False
+    macro_yfinance_tickers: Dict[str, str] = field(default_factory=lambda: {
+        "brent": "BZ=F",       # Brent crude oil futures
+        "vix": "^VIX",         # CBOE volatility index
+        "dxy": "DX-Y.NYB",     # U.S. Dollar Index
+        "sp500": "^GSPC",      # S&P 500 index
+        "btc": "BTC-USD",      # Bitcoin in USD
+    })
+    # Fallback tickers are tried only if the primary Yahoo ticker returns empty.
+    # The most useful fallback is DXY, because Yahoo availability can differ by region/version.
+    macro_yfinance_fallback_tickers: Dict[str, List[str]] = field(default_factory=lambda: {
+        "dxy": ["DX=F", "UUP"],
+        "brent": ["BZ=F"],
+        "vix": ["^VIX"],
+        "sp500": ["^GSPC", "SPY"],
+        "btc": ["BTC-USD"],
+    })
+    # Additional automatic macro-data fallbacks. These sources are tried after
+    # yfinance fails. FRED is used without an API key through the public CSV
+    # endpoint. Stooq is used through its public daily CSV endpoint.
+    # Notes:
+    # - DXY is first attempted as the ICE DXY future through Yahoo/Stooq; if that
+    #   fails, FRED DTWEXBGS is used as a broad dollar-index proxy.
+    # - BTC return is built directly from the CoinGecko BTCUSDT series whenever available.
+    macro_fred_series: Dict[str, str] = field(default_factory=lambda: {
+        "brent": "DCOILBRENTEU",   # Brent crude oil spot price, Europe, USD/bbl
+        "vix": "VIXCLS",           # CBOE volatility index close
+        "dxy": "DTWEXBGS",         # Nominal broad U.S. dollar index proxy
+        "sp500": "SP500",          # S&P 500 close
+    })
+    macro_stooq_tickers: Dict[str, List[str]] = field(default_factory=lambda: {
+        # Stooq symbols vary by region; these are tried only after FRED/yfinance.
+        "brent": ["brn.f", "cb.f", "sc.f", "qa.f"],
+        "vix": ["^vix", "vix"],
+        "dxy": ["dx.f", "dxy"],
+        "sp500": ["^spx", "spx", "spy.us"],
+    })
+
+    macro_controls_candidates: List[str] = field(default_factory=lambda: [
+        r"C:\Users\11372\Desktop\加密事件分析\macro_controls.csv",
+        "/mnt/data/macro_controls.csv",
+        "./macro_controls.csv",
+    ])
+
+    portwatch_arrivals_candidates: List[str] = field(default_factory=lambda: [
+        r"C:\Users\11372\Desktop\加密事件分析\arrivals-of-ships.csv",
+        r"C:\Users\11372\Desktop\加密事件分析\arrivals-of-ships(1).csv",
+        "/mnt/data/arrivals-of-ships(1).csv",
+        "./arrivals-of-ships.csv",
+        "./arrivals-of-ships(1).csv",
+    ])
+    portwatch_volume_candidates: List[str] = field(default_factory=lambda: [
+        r"C:\Users\11372\Desktop\加密事件分析\chart.csv",
+        r"C:\Users\11372\Desktop\加密事件分析\chart(1).csv",
+        "/mnt/data/chart(1).csv",
+        "./chart.csv",
+        "./chart(1).csv",
+    ])
+
+    stablecoin_ids: Dict[str, str] = field(default_factory=lambda: {
+        "USDT": "tether",
+        "USDC": "usd-coin",
+        "DAI": "dai",
+    })
+
+
+CFG = Config()
+
+
+# =========================================================
+# Asset universe: 30 non-stable cryptoassets, ADA included
+# =========================================================
+
+# coingecko_id, coinmetrics_asset, use-case label, optional Artemis chain symbol
+ASSET_MASTER: Dict[str, Dict[str, Any]] = {
+    "BTCUSDT":  {"coingecko_id": "bitcoin", "cm_asset": "btc", "group": "reserve/payment settlement", "artemis": "bitcoin"},
+    "ETHUSDT":  {"coingecko_id": "ethereum", "cm_asset": "eth", "group": "stablecoin/smart-contract settlement", "artemis": "eth"},
+    "BNBUSDT":  {"coingecko_id": "binancecoin", "cm_asset": "bnb", "group": "platform/exchange settlement", "artemis": "bsc"},
+    "SOLUSDT":  {"coingecko_id": "solana", "cm_asset": "sol", "group": "high-throughput settlement", "artemis": "sol"},
+    "XRPUSDT":  {"coingecko_id": "ripple", "cm_asset": "xrp", "group": "cross-border settlement", "artemis": "xrp"},
+    "ADAUSDT":  {"coingecko_id": "cardano", "cm_asset": "ada", "group": "low-payment-use benchmark", "artemis": "cardano"},
+    "DOGEUSDT": {"coingecko_id": "dogecoin", "cm_asset": "doge", "group": "meme/speculative benchmark", "artemis": "doge"},
+    "TRXUSDT":  {"coingecko_id": "tron", "cm_asset": "trx", "group": "stablecoin transfer network", "artemis": "tron"},
+    "TONUSDT":  {"coingecko_id": "the-open-network", "cm_asset": "ton", "group": "consumer wallet/app payment", "artemis": "ton"},
+    "LTCUSDT":  {"coingecko_id": "litecoin", "cm_asset": "ltc", "group": "native peer-to-peer payment", "artemis": "litecoin"},
+    "XLMUSDT":  {"coingecko_id": "stellar", "cm_asset": "xlm", "group": "cross-border/remittance", "artemis": "stellar"},
+    "BCHUSDT":  {"coingecko_id": "bitcoin-cash", "cm_asset": "bch", "group": "native peer-to-peer payment", "artemis": "bch"},
+    "ALGOUSDT": {"coingecko_id": "algorand", "cm_asset": "algo", "group": "low-cost settlement L1", "artemis": "algorand"},
+    "HBARUSDT": {"coingecko_id": "hedera-hashgraph", "cm_asset": "hbar", "group": "enterprise/payment settlement", "artemis": "hedera"},
+    "AVAXUSDT": {"coingecko_id": "avalanche-2", "cm_asset": "avax", "group": "smart-contract settlement L1", "artemis": "avax"},
+    "ATOMUSDT": {"coingecko_id": "cosmos", "cm_asset": "atom", "group": "interoperability settlement", "artemis": "cosmos"},
+    "ARBUSDT":  {"coingecko_id": "arbitrum", "cm_asset": "arb", "group": "L2 settlement/governance", "artemis": "arb"},
+    "OPUSDT":   {"coingecko_id": "optimism", "cm_asset": "op", "group": "L2 settlement/governance", "artemis": "op"},
+    "NEARUSDT": {"coingecko_id": "near", "cm_asset": "near", "group": "general smart-contract L1", "artemis": "near"},
+    "SUIUSDT":  {"coingecko_id": "sui", "cm_asset": "sui", "group": "emerging high-throughput L1", "artemis": "sui"},
+    "APTUSDT":  {"coingecko_id": "aptos", "cm_asset": "apt", "group": "emerging high-throughput L1", "artemis": "aptos"},
+    "DOTUSDT":  {"coingecko_id": "polkadot", "cm_asset": "dot", "group": "interoperability infrastructure", "artemis": "polkadot"},
+    "ICPUSDT":  {"coingecko_id": "internet-computer", "cm_asset": "icp", "group": "compute/infrastructure", "artemis": "icp"},
+    "ETCUSDT":  {"coingecko_id": "ethereum-classic", "cm_asset": "etc", "group": "legacy L1 benchmark", "artemis": "etc"},
+    "FILUSDT":  {"coingecko_id": "filecoin", "cm_asset": "fil", "group": "storage utility benchmark", "artemis": "filecoin"},
+    "LINKUSDT": {"coingecko_id": "chainlink", "cm_asset": "link", "group": "oracle infrastructure benchmark", "artemis": "link"},
+    "UNIUSDT":  {"coingecko_id": "uniswap", "cm_asset": "uni", "group": "DEX governance benchmark", "artemis": "uniswap"},
+    "AAVEUSDT": {"coingecko_id": "aave", "cm_asset": "aave", "group": "lending governance benchmark", "artemis": "aave"},
+    "INJUSDT":  {"coingecko_id": "injective-protocol", "cm_asset": "inj", "group": "trading/DeFi infrastructure", "artemis": "injective"},
+    "SEIUSDT":  {"coingecko_id": "sei-network", "cm_asset": "sei", "group": "trading/settlement chain", "artemis": "sei"},
+}
+
+ASSET_UNIVERSE = list(ASSET_MASTER.keys())
+
+
+# DefiLlama chain names for chain-level stablecoin settlement-capacity proxies.
+# Only native chain / settlement-layer assets receive a chain mapping. Application or governance
+# tokens such as AAVE, UNI, LINK, and FIL are deliberately left unmapped to avoid pretending that
+# Ethereum stablecoin supply belongs mechanically to those tokens.
+DEFI_LLAMA_CHAIN_MAP: Dict[str, Optional[str]] = {
+    "BTCUSDT": None,
+    "ETHUSDT": "Ethereum",
+    "BNBUSDT": "BSC",
+    "SOLUSDT": "Solana",
+    "XRPUSDT": "XRPL",
+    "ADAUSDT": "Cardano",
+    "DOGEUSDT": None,
+    "TRXUSDT": "Tron",
+    "TONUSDT": "TON",
+    "LTCUSDT": None,
+    "XLMUSDT": "Stellar",
+    "BCHUSDT": None,
+    "ALGOUSDT": "Algorand",
+    "HBARUSDT": "Hedera",
+    "AVAXUSDT": "Avalanche",
+    "ATOMUSDT": "Cosmos",
+    "ARBUSDT": "Arbitrum",
+    "OPUSDT": "Optimism",
+    "NEARUSDT": "Near",
+    "SUIUSDT": "Sui",
+    "APTUSDT": "Aptos",
+    "DOTUSDT": "Polkadot",
+    "ICPUSDT": "ICP",
+    "ETCUSDT": None,
+    "FILUSDT": None,
+    "LINKUSDT": None,
+    "UNIUSDT": None,
+    "AAVEUSDT": None,
+    "INJUSDT": "Injective",
+    "SEIUSDT": "Sei",
+}
+
+
+# =========================================================
+# Events and episodes
+# =========================================================
+
+FIXED_HORMUZ_EVENTS = [
+    {"event_id": "E001", "event_date": "2026-02-28", "event_type": "act_escalation", "event_weight": 1.5, "event_name": "Conflict begins; Hormuz largely blocked", "car_post_days": 5, "portwatch_window_days": 3, "stable_window_days": 7, "peg_window_days": 3},
+    {"event_id": "E002", "event_date": "2026-04-07", "event_type": "de_escalation", "event_weight": 0.5, "event_name": "Iran sets conditions for lasting peace talks and Hormuz fees", "car_post_days": 5, "portwatch_window_days": 3, "stable_window_days": 7, "peg_window_days": 3},
+    {"event_id": "E003", "event_date": "2026-04-08", "event_type": "de_escalation", "event_weight": 0.5, "event_name": "Shippers seek clarity on passage after ceasefire deal", "car_post_days": 5, "portwatch_window_days": 3, "stable_window_days": 7, "peg_window_days": 3},
+    {"event_id": "E004", "event_date": "2026-04-09", "event_type": "threat", "event_weight": 1.0, "event_name": "IMO says toll for using Hormuz would be a dangerous precedent", "car_post_days": 5, "portwatch_window_days": 3, "stable_window_days": 7, "peg_window_days": 3},
+    {"event_id": "E005", "event_date": "2026-04-10", "event_type": "de_escalation", "event_weight": 0.5, "event_name": "Trump says Strait of Hormuz will be open fairly soon", "car_post_days": 5, "portwatch_window_days": 3, "stable_window_days": 7, "peg_window_days": 3},
+    {"event_id": "E006", "event_date": "2026-04-13", "event_type": "act_escalation", "event_weight": 1.5, "event_name": "Failed talks followed by U.S. blockade escalation", "car_post_days": 5, "portwatch_window_days": 3, "stable_window_days": 7, "peg_window_days": 3},
+    {"event_id": "E007", "event_date": "2026-04-17", "event_type": "de_escalation", "event_weight": 0.5, "event_name": "Iran says Hormuz open during ceasefire; ships test passage", "car_post_days": 2, "portwatch_window_days": 2, "stable_window_days": 2, "peg_window_days": 2},
+]
+
+EPISODES = [
+    {"event_id": "EP_FEB_BLOCKADE", "event_date": "2026-02-28", "event_type": "blockade_episode", "event_weight": 1.5, "event_name": "February blockade episode", "car_post_days": 5, "portwatch_window_days": 3, "stable_window_days": 7, "peg_window_days": 3},
+    {"event_id": "EP_APRIL_CLUSTER", "event_date": "2026-04-07", "event_type": "april_cluster_episode", "event_weight": 0.75, "event_name": "April Hormuz cluster: negotiations, toll threat, escalation, reopening signals", "car_post_days": 12, "portwatch_window_days": 6, "stable_window_days": 12, "peg_window_days": 12},
+]
+
+
+# =========================================================
+# General utilities
+# =========================================================
+
+def utc(dt) -> pd.Timestamp:
+    ts = pd.Timestamp(dt)
+    if ts.tzinfo is None:
+        return ts.tz_localize("UTC")
+    return ts.tz_convert("UTC")
+
+
+def add_days(ts, n: int) -> pd.Timestamp:
+    return utc(ts).floor("D") + pd.Timedelta(days=int(n))
+
+
+def zscore(s: pd.Series) -> pd.Series:
+    s = pd.to_numeric(s, errors="coerce")
+    sd = s.std(ddof=0)
+    if pd.isna(sd) or sd == 0:
+        return pd.Series(np.nan, index=s.index)
+    return (s - s.mean()) / sd
+
+
+def winsorize_series(s: pd.Series, lower=0.02, upper=0.98) -> pd.Series:
+    s2 = pd.to_numeric(s, errors="coerce")
+    lo = s2.quantile(lower)
+    hi = s2.quantile(upper)
+    return s2.clip(lo, hi)
+
+
+def print_section(title: str):
+    print("\n" + "=" * 110)
+    print(title)
+    print("=" * 110)
+
+
+def print_df(title: str, df: pd.DataFrame, max_rows: Optional[int] = None):
+    print_section(title)
+    if df is None or df.empty:
+        print("[EMPTY]")
+        return
+    out = df.copy()
+    if max_rows is not None and len(out) > max_rows:
+        print(out.head(max_rows).to_string(index=False))
+        print(f"\n... ({len(out)} rows total; first {max_rows} shown)")
+    else:
+        print(out.to_string(index=False))
+
+
+def make_session() -> requests.Session:
+    s = requests.Session()
+    retry = Retry(
+        total=5,
+        connect=5,
+        read=5,
+        backoff_factor=0.8,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    s.headers.update({"User-Agent": "Mozilla/5.0 (HormuzObjectiveEpisodeStudy/1.0)", "Accept": "application/json,text/plain,*/*"})
+    return s
+
+
+SESSION = make_session()
+
+
+def ensure_cache_dir():
+    Path(CFG.cache_dir).mkdir(parents=True, exist_ok=True)
+
+
+def ensure_output_dir():
+    Path(CFG.output_dir).mkdir(parents=True, exist_ok=True)
+
+
+def cache_path(prefix: str, payload: dict) -> Path:
+    ensure_cache_dir()
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    h = hashlib.md5(raw.encode("utf-8")).hexdigest()
+    return Path(CFG.cache_dir) / f"{prefix}_{h}.json"
+
+
+def save_cache(path: Path, obj):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False)
+
+
+def load_cache(path: Path):
+    if not path.exists():
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def request_json_with_backoff(url: str, params: Optional[dict] = None, headers: Optional[dict] = None, timeout: Optional[int] = None, retry_waits: Optional[List[int]] = None, max_retries: Optional[int] = None):
+    waits = retry_waits or CFG.retry_waits
+    if max_retries is None:
+        max_retries = len(waits)
+    timeout = timeout or CFG.timeout_sec
+    last_msg = None
+    for attempt in range(max_retries):
+        try:
+            r = SESSION.get(url, params=params, headers=headers, timeout=timeout)
+        except Exception as e:
+            wait = waits[min(attempt, len(waits) - 1)]
+            last_msg = f"Request error for {url}: {e}"
+            if getattr(CFG, "verbose_download_logs", False):
+                print(f"[retry] {last_msg}; sleep {wait}s")
+            time.sleep(wait)
+            continue
+        txt = (r.text or "")[:800]
+        if r.status_code == 200:
+            try:
+                return r.json()
+            except Exception as e:
+                raise RuntimeError(f"Non-JSON response from {r.url}; preview={txt}") from e
+        if r.status_code == 429:
+            retry_after = r.headers.get("Retry-After")
+            wait = int(retry_after) if retry_after and retry_after.isdigit() else waits[min(attempt, len(waits) - 1)]
+            last_msg = f"HTTP 429 from {r.url}; preview={txt}"
+            if getattr(CFG, "verbose_download_logs", False):
+                print(f"[rate-limit] {last_msg}; sleep {wait}s")
+            time.sleep(wait)
+            continue
+        if r.status_code in (500, 502, 503, 504):
+            wait = waits[min(attempt, len(waits) - 1)]
+            last_msg = f"HTTP {r.status_code} from {r.url}; preview={txt}"
+            if getattr(CFG, "verbose_download_logs", False):
+                print(f"[server-retry] {last_msg}; sleep {wait}s")
+            time.sleep(wait)
+            continue
+        raise RuntimeError(f"HTTP {r.status_code} from {r.url}; preview={txt}")
+    raise RuntimeError(last_msg or f"Request failed after retries: {url}")
+
+
+# =========================================================
+# Event builders
+# =========================================================
+
+def build_events(raw_list: List[dict], cfg: Config) -> pd.DataFrame:
+    df = pd.DataFrame(raw_list).copy()
+    df["event_date"] = pd.to_datetime(df["event_date"], utc=True)
+    for col, default in [("car_post_days", cfg.default_event_car_days), ("portwatch_window_days", 3), ("stable_window_days", 7), ("peg_window_days", 3)]:
+        if col not in df.columns:
+            df[col] = default
+        df[col] = df[col].fillna(default).astype(int)
+    return df.sort_values("event_date").reset_index(drop=True)
+
+
+# =========================================================
+# CoinGecko market data
+# =========================================================
+
+def detect_coingecko_mode(api_key: str) -> Tuple[str, Dict[str, str]]:
+    if not api_key:
+        raise RuntimeError("CoinGecko API key is empty.")
+    # Try Pro first, then Demo.
+    try:
+        r = SESSION.get("https://pro-api.coingecko.com/api/v3/ping", headers={"x-cg-pro-api-key": api_key}, timeout=30)
+        if r.status_code == 200:
+            return "https://pro-api.coingecko.com/api/v3", {"x-cg-pro-api-key": api_key}
+    except Exception:
+        pass
+    try:
+        r = SESSION.get("https://api.coingecko.com/api/v3/ping", headers={"x-cg-demo-api-key": api_key}, timeout=30)
+        if r.status_code == 200:
+            return "https://api.coingecko.com/api/v3", {"x-cg-demo-api-key": api_key}
+    except Exception:
+        pass
+    raise RuntimeError("Could not validate CoinGecko API key as Pro or Demo.")
+
+
+def fetch_coingecko_market_range(coin_id: str, from_ts: int, to_ts: int, base_url: str, headers: Dict[str, str]) -> pd.DataFrame:
+    # Demo API has practical historical limits for some endpoints. Clamp to a one-year window relative to end.
+    if "api.coingecko.com/api/v3" in base_url:
+        max_lookback_sec = 365 * 24 * 3600
+        min_allowed_ts = to_ts - max_lookback_sec + 24 * 3600
+        from_ts = max(from_ts, min_allowed_ts)
+    payload = {"coin_id": coin_id, "from_ts": from_ts, "to_ts": to_ts, "base_url": base_url}
+    cpath = cache_path("coingecko_market", payload)
+    cached = load_cache(cpath)
+    if cached is not None:
+        df = pd.DataFrame(cached)
+        if not df.empty:
+            df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
+        return df
+    url = f"{base_url}/coins/{coin_id}/market_chart/range"
+    params = {"vs_currency": "usd", "from": from_ts, "to": to_ts}
+    data = request_json_with_backoff(url, params=params, headers=headers)
+    prices = data.get("prices", [])
+    market_caps = data.get("market_caps", [])
+    volumes = data.get("total_volumes", [])
+
+    def to_df(arr, name):
+        if not arr:
+            return pd.DataFrame(columns=["date", name])
+        out = pd.DataFrame(arr, columns=["ts_ms", name])
+        out["date"] = pd.to_datetime(out["ts_ms"], unit="ms", utc=True).dt.floor("D")
+        return out.groupby("date", as_index=False)[name].last()
+
+    out = to_df(prices, "price").merge(to_df(market_caps, "market_cap"), on="date", how="outer").merge(to_df(volumes, "volume"), on="date", how="outer")
+    out = out.sort_values("date").reset_index(drop=True)
+    save_cache(cpath, out.assign(date=out["date"].astype(str)).to_dict(orient="records"))
+    return out
+
+
+def build_crypto_price_panel(asset_symbols: List[str], cfg: Config, start_dt: datetime, end_dt: datetime) -> pd.DataFrame:
+    base_url, headers = detect_coingecko_mode(cfg.coingecko_api_key)
+    frames = []
+    from_ts = int(utc(start_dt).timestamp())
+    to_ts = int(utc(end_dt).timestamp())
+    for sym in asset_symbols:
+        coin_id = ASSET_MASTER[sym]["coingecko_id"]
+        try:
+            if getattr(CFG, "verbose_download_logs", False):
+                print(f"[coingecko] {sym} ({coin_id})")
+            df = fetch_coingecko_market_range(coin_id, from_ts, to_ts, base_url, headers)
+            if df.empty:
+                if getattr(CFG, "verbose_download_logs", False):
+                    print(f"  [skip] empty CoinGecko data for {sym}")
+                continue
+            df["symbol"] = sym
+            df["ret"] = np.log(pd.to_numeric(df["price"], errors="coerce")).diff()
+            frames.append(df[["date", "symbol", "price", "market_cap", "volume", "ret"]].copy())
+            time.sleep(cfg.sleep_sec)
+        except Exception as e:
+            if getattr(CFG, "verbose_download_logs", False):
+                print(f"  [skip] CoinGecko failed for {sym}: {e}")
+    if not frames:
+        return pd.DataFrame(columns=["date", "symbol", "price", "market_cap", "volume", "ret"])
+    out = pd.concat(frames, ignore_index=True)
+    out = out[out["date"] <= utc(cfg.effective_data_end_date).floor("D")].copy()
+    return out
+
+
+def build_stablecoin_market_panel(cfg: Config, start_dt: datetime, end_dt: datetime) -> pd.DataFrame:
+    base_url, headers = detect_coingecko_mode(cfg.coingecko_api_key)
+    frames = []
+    from_ts = int(utc(start_dt).timestamp())
+    to_ts = int(utc(end_dt).timestamp())
+    for stable, coin_id in cfg.stablecoin_ids.items():
+        try:
+            df = fetch_coingecko_market_range(coin_id, from_ts, to_ts, base_url, headers)
+            if df.empty:
+                continue
+            df["stable_symbol"] = stable
+            frames.append(df[["date", "stable_symbol", "price", "market_cap", "volume"]])
+            time.sleep(cfg.sleep_sec)
+        except Exception as e:
+            if getattr(CFG, "verbose_download_logs", False):
+                print(f"[stablecoin] skip {stable}: {e}")
+    if not frames:
+        return pd.DataFrame(columns=["date", "stable_symbol", "price", "market_cap", "volume"])
+    return pd.concat(frames, ignore_index=True)
+
+
+# =========================================================
+# Coin Metrics objective on-chain data
+# =========================================================
+
+CM_METRICS = ["TxTfrValAdjUSD", "AdrActCnt", "TxCnt"]
+
+
+def fetch_coinmetrics_asset_metrics(cm_asset: str, start_dt: datetime, end_dt: datetime, metrics: List[str] = CM_METRICS) -> pd.DataFrame:
+    payload = {"asset": cm_asset, "start": str(utc(start_dt).date()), "end": str(utc(end_dt).date()), "metrics": metrics}
+    cpath = cache_path("coinmetrics_asset_metrics", payload)
+    cached = load_cache(cpath)
+    if cached is not None:
+        df = pd.DataFrame(cached)
+        if not df.empty:
+            df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
+        return df
+    url = f"{CFG.coinmetrics_base_url}/timeseries/asset-metrics"
+    params = {
+        "assets": cm_asset,
+        "metrics": ",".join(metrics),
+        "start_time": str(utc(start_dt).date()),
+        "end_time": str(utc(end_dt).date()),
+        "frequency": "1d",
+        "page_size": 10000,
+    }
+    try:
+        data = request_json_with_backoff(url, params=params, timeout=CFG.timeout_sec, max_retries=3)
+    except Exception as e:
+        # Some assets/metrics are not in Community API. Return empty and let the model use fallback variables.
+        if getattr(CFG, "verbose_download_logs", False):
+            print(f"[coinmetrics] unavailable {cm_asset}: {e}")
+        return pd.DataFrame(columns=["date", "cm_asset"] + metrics)
+    rows = data.get("data", []) if isinstance(data, dict) else []
+    if not rows:
+        return pd.DataFrame(columns=["date", "cm_asset"] + metrics)
+    out = pd.DataFrame(rows)
+    out["date"] = pd.to_datetime(out["time"], utc=True, errors="coerce").dt.floor("D")
+    out["cm_asset"] = cm_asset
+    for m in metrics:
+        if m not in out.columns:
+            out[m] = np.nan
+        out[m] = pd.to_numeric(out[m], errors="coerce")
+    out = out[["date", "cm_asset"] + metrics].sort_values("date").reset_index(drop=True)
+    save_cache(cpath, out.assign(date=out["date"].astype(str)).to_dict(orient="records"))
+    return out
+
+
+def build_coinmetrics_panel(asset_symbols: List[str], start_dt: datetime, end_dt: datetime) -> pd.DataFrame:
+    frames = []
+    for sym in asset_symbols:
+        cm_asset = ASSET_MASTER[sym].get("cm_asset", "")
+        if not cm_asset:
+            continue
+        df = fetch_coinmetrics_asset_metrics(cm_asset, start_dt, end_dt)
+        if df.empty:
+            continue
+        df["symbol"] = sym
+        frames.append(df)
+        time.sleep(CFG.sleep_sec)
+    if not frames:
+        return pd.DataFrame(columns=["date", "symbol", "cm_asset"] + CM_METRICS)
+    return pd.concat(frames, ignore_index=True)
+
+
+# =========================================================
+# Optional Artemis P2P stablecoin transfer volume
+# =========================================================
+
+def fetch_artemis_p2p_stablecoin_volume(artemis_symbol: str, start_dt: datetime, end_dt: datetime) -> pd.DataFrame:
+    """Best-effort optional Artemis call.
+
+    Artemis endpoint conventions may differ by account plan. If ARTEMIS_API_KEY is absent or
+    the endpoint returns an error, the script silently falls back to Coin Metrics / CoinGecko variables.
+    """
+    if not CFG.artemis_api_key or not artemis_symbol:
+        return pd.DataFrame(columns=["date", "artemis_symbol", "p2p_stablecoin_transfer_volume"])
+    payload = {"symbol": artemis_symbol, "start": str(utc(start_dt).date()), "end": str(utc(end_dt).date()), "base": CFG.artemis_base_url}
+    cpath = cache_path("artemis_p2p_stablecoin_volume", payload)
+    cached = load_cache(cpath)
+    if cached is not None:
+        df = pd.DataFrame(cached)
+        if not df.empty:
+            df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
+        return df
+    # Common Artemis docs reference /data/P2P_STABLECOIN_TRANSFER_VOLUME.
+    url = f"{CFG.artemis_base_url}/data/P2P_STABLECOIN_TRANSFER_VOLUME"
+    headers = {"Authorization": f"Bearer {CFG.artemis_api_key}", "x-api-key": CFG.artemis_api_key, "Accept": "application/json"}
+    params_variants = [
+        {"symbol": artemis_symbol, "startDate": str(utc(start_dt).date()), "endDate": str(utc(end_dt).date())},
+        {"symbols": artemis_symbol, "start_date": str(utc(start_dt).date()), "end_date": str(utc(end_dt).date())},
+    ]
+    for params in params_variants:
+        try:
+            data = request_json_with_backoff(url, params=params, headers=headers, timeout=CFG.timeout_sec, max_retries=2)
+            rows = data.get("data", data if isinstance(data, list) else []) if isinstance(data, (dict, list)) else []
+            df = pd.DataFrame(rows)
+            if df.empty:
+                continue
+            # Try to infer date and volume column.
+            date_col = next((c for c in df.columns if str(c).lower() in ["date", "time", "timestamp"]), None)
+            vol_col = next((c for c in df.columns if "volume" in str(c).lower() or "transfer" in str(c).lower()), None)
+            if date_col is None or vol_col is None:
+                continue
+            out = pd.DataFrame({
+                "date": pd.to_datetime(df[date_col], utc=True, errors="coerce").dt.floor("D"),
+                "artemis_symbol": artemis_symbol,
+                "p2p_stablecoin_transfer_volume": pd.to_numeric(df[vol_col], errors="coerce"),
+            }).dropna(subset=["date"])
+            save_cache(cpath, out.assign(date=out["date"].astype(str)).to_dict(orient="records"))
+            return out
+        except Exception:
+            continue
+    return pd.DataFrame(columns=["date", "artemis_symbol", "p2p_stablecoin_transfer_volume"])
+
+
+def build_artemis_panel(asset_symbols: List[str], start_dt: datetime, end_dt: datetime) -> pd.DataFrame:
+    if not CFG.artemis_api_key:
+        return pd.DataFrame(columns=["date", "symbol", "p2p_stablecoin_transfer_volume"])
+    frames = []
+    for sym in asset_symbols:
+        art_sym = ASSET_MASTER[sym].get("artemis", "")
+        df = fetch_artemis_p2p_stablecoin_volume(art_sym, start_dt, end_dt)
+        if not df.empty:
+            df["symbol"] = sym
+            frames.append(df[["date", "symbol", "p2p_stablecoin_transfer_volume"]])
+            time.sleep(CFG.sleep_sec)
+    if not frames:
+        return pd.DataFrame(columns=["date", "symbol", "p2p_stablecoin_transfer_volume"])
+    return pd.concat(frames, ignore_index=True)
+
+
+# =========================================================
+# DefiLlama stablecoin-settlement capacity proxy
+# =========================================================
+
+def _extract_defillama_usd_value(row: dict) -> float:
+    """Robustly extract USD-pegged stablecoin supply from DefiLlama stablecoin chart rows."""
+    if not isinstance(row, dict):
+        return np.nan
+    candidate_keys = [
+        "totalCirculatingUSD", "totalCirculating", "totalCirculatingPeggedUSD",
+        "totalStablecoins", "stablecoins", "mcap", "marketCap", "totalMcap",
+    ]
+    for k in candidate_keys:
+        if k not in row:
+            continue
+        v = row.get(k)
+        if isinstance(v, dict):
+            for kk in ["peggedUSD", "usd", "USD", "total", "value"]:
+                if kk in v:
+                    try:
+                        return float(v[kk])
+                    except Exception:
+                        pass
+        else:
+            try:
+                return float(v)
+            except Exception:
+                pass
+    return np.nan
+
+
+def fetch_defillama_stablecoin_chart(chain: str, cfg: Config) -> pd.DataFrame:
+    """Fetch daily chain-level stablecoin market cap/supply from DefiLlama.
+
+    This is a free settlement-capacity proxy, not a direct transfer-volume measure.
+    """
+    if not chain:
+        return pd.DataFrame(columns=["date", "defillama_chain", "stablecoin_mcap_usd"])
+    payload = {"chain": chain, "base": cfg.defillama_stable_base_url}
+    cpath = cache_path("defillama_stablecoin_chain_chart", payload)
+    cached = load_cache(cpath)
+    if cached is not None:
+        df = pd.DataFrame(cached)
+        if not df.empty:
+            df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
+        return df
+
+    from urllib.parse import quote
+    chain_variants = list(dict.fromkeys([chain, chain.lower(), chain.replace(" ", "-"), chain.replace(" ", "%20")]))
+    urls = []
+    for ch in chain_variants:
+        q = quote(ch, safe="%")
+        urls.extend([
+            f"{cfg.defillama_stable_base_url}/stablecoincharts/{q}",
+            f"{cfg.defillama_stable_base_url}/stablecoincharts/{q}?stablecoin=1",
+        ])
+    rows = []
+    last_error = None
+    for url in urls:
+        try:
+            data = request_json_with_backoff(url, params=None, headers=None, timeout=cfg.timeout_sec, max_retries=2)
+            if isinstance(data, dict):
+                raw_rows = data.get("data") or data.get("chart") or data.get("peggedAssets") or []
+            elif isinstance(data, list):
+                raw_rows = data
+            else:
+                raw_rows = []
+            if not raw_rows:
+                continue
+            for r in raw_rows:
+                if not isinstance(r, dict):
+                    continue
+                dt = r.get("date") or r.get("timestamp") or r.get("time")
+                if dt is None:
+                    continue
+                try:
+                    if isinstance(dt, (int, float)) or (isinstance(dt, str) and dt.isdigit()):
+                        date = pd.to_datetime(int(float(dt)), unit="s", utc=True).floor("D")
+                    else:
+                        date = pd.to_datetime(dt, utc=True, errors="coerce").floor("D")
+                except Exception:
+                    date = pd.NaT
+                val = _extract_defillama_usd_value(r)
+                if pd.notna(date) and pd.notna(val):
+                    rows.append({"date": date, "defillama_chain": chain, "stablecoin_mcap_usd": val})
+            if rows:
+                break
+        except Exception as e:
+            last_error = e
+            continue
+    if not rows:
+        if last_error is not None:
+            if getattr(CFG, "verbose_download_logs", False):
+                print(f"[defillama] unavailable {chain}: {last_error}")
+        else:
+            if getattr(CFG, "verbose_download_logs", False):
+                print(f"[defillama] unavailable {chain}: empty response")
+        return pd.DataFrame(columns=["date", "defillama_chain", "stablecoin_mcap_usd"])
+    out = pd.DataFrame(rows).drop_duplicates(["date", "defillama_chain"]).sort_values("date").reset_index(drop=True)
+    save_cache(cpath, out.assign(date=out["date"].astype(str)).to_dict(orient="records"))
+    return out
+
+
+def build_defillama_chain_stablecoin_panel(asset_symbols: List[str], cfg: Config) -> pd.DataFrame:
+    """Build an asset-chain-day panel of stablecoin settlement capacity from DefiLlama."""
+    frames = []
+    seen_chains = {}
+    for sym in asset_symbols:
+        chain = DEFI_LLAMA_CHAIN_MAP.get(sym)
+        if not chain:
+            continue
+        if chain not in seen_chains:
+            seen_chains[chain] = fetch_defillama_stablecoin_chart(chain, cfg)
+            time.sleep(cfg.sleep_sec)
+        df = seen_chains[chain]
+        if df is None or df.empty:
+            continue
+        z = df.copy()
+        z["symbol"] = sym
+        z["defillama_chain"] = chain
+        frames.append(z[["date", "symbol", "defillama_chain", "stablecoin_mcap_usd"]])
+    if not frames:
+        return pd.DataFrame(columns=["date", "symbol", "defillama_chain", "stablecoin_mcap_usd"])
+    return pd.concat(frames, ignore_index=True)
+
+
+def augment_exposure_with_defillama_stable_metrics(exposure: pd.DataFrame, price_panel: pd.DataFrame, dl_panel: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    """Add free DefiLlama chain-stablecoin supply proxies to the exposure table."""
+    out = exposure.copy()
+    if out.empty:
+        return out
+    metric_rows = []
+    for _, r in out.iterrows():
+        sym = r["symbol"]
+        t = utc(r["event_date"]).floor("D") if "event_date" in r else utc(r["objective_window_end"]).floor("D")
+        pre_end = utc(r.get("objective_window_end", t - pd.Timedelta(days=cfg.objective_gap_days))).floor("D")
+        pre_start = utc(r.get("objective_window_start", pre_end - pd.Timedelta(days=cfg.objective_pre_days - 1))).floor("D")
+        chain = DEFI_LLAMA_CHAIN_MAP.get(sym)
+        dz = dl_panel[(dl_panel["symbol"] == sym) & (dl_panel["date"] >= pre_start) & (dl_panel["date"] <= pre_end)].copy() if dl_panel is not None and not dl_panel.empty else pd.DataFrame()
+        mean_stable = dz["stablecoin_mcap_usd"].mean() if not dz.empty else np.nan
+        valid = dz.sort_values("date")["stablecoin_mcap_usd"].dropna() if not dz.empty else pd.Series(dtype=float)
+        first_stable = valid.iloc[0] if len(valid) else np.nan
+        last_stable = valid.iloc[-1] if len(valid) else np.nan
+        change = np.nan if pd.isna(first_stable) or first_stable <= 0 or pd.isna(last_stable) else last_stable / first_stable - 1.0
+        mean_mcap = r.get("mean_mcap_90d", np.nan)
+        ratio = np.nan if pd.isna(mean_stable) or pd.isna(mean_mcap) or mean_mcap <= 0 else mean_stable / mean_mcap
+        metric_rows.append({
+            "event_id": r["event_id"], "symbol": sym,
+            "defillama_chain": chain,
+            "dl_stablecoin_mcap_mean_90d": mean_stable,
+            "dl_stablecoin_mcap_ratio_90d": ratio,
+            "dl_stablecoin_mcap_change_90d": change,
+            "dl_stablecoin_obs_days_90d": int(len(dz)) if not dz.empty else 0,
+            "dl_settlement_proxy_note": "chain stablecoin supply / token market cap; settlement-capacity proxy, not transfer volume" if chain else "not chain-mapped asset",
+        })
+    metr = pd.DataFrame(metric_rows)
+    out = out.merge(metr, on=["event_id", "symbol"], how="left")
+    out["log_dl_stablecoin_mcap_ratio_90d"] = np.log1p(pd.to_numeric(out["dl_stablecoin_mcap_ratio_90d"], errors="coerce").clip(lower=0))
+    out["log_dl_stablecoin_mcap_mean_90d"] = np.log1p(pd.to_numeric(out["dl_stablecoin_mcap_mean_90d"], errors="coerce").clip(lower=0))
+    out["dl_stablecoin_mcap_change_90d_winsor"] = out.groupby("event_id")["dl_stablecoin_mcap_change_90d"].transform(lambda s: winsorize_series(s, 0.02, 0.98))
+    for c in ["log_dl_stablecoin_mcap_ratio_90d", "log_dl_stablecoin_mcap_mean_90d", "dl_stablecoin_mcap_change_90d_winsor"]:
+        out[c + "_z"] = out.groupby("event_id")[c].transform(zscore)
+    out["objective_settlement_capacity_z"] = out["log_dl_stablecoin_mcap_ratio_90d_z"]
+    out["objective_settlement_growth_z"] = out["dl_stablecoin_mcap_change_90d_winsor_z"]
+    turn_col = "log_cg_exchange_turnover_mcap_90d_z"
+
+    # Full-sample fallback retained only as a diagnostic/appendix-style variable:
+    # if settlement capacity is missing, pandas skips the missing value and the
+    # measure reduces to standardized turnover. This is NOT the baseline hybrid.
+    out["objective_tradable_settlement_fullsample_z"] = out[[turn_col, "objective_settlement_capacity_z"]].mean(axis=1, skipna=True)
+
+    # Baseline mapped-sample hybrid:
+    # defined only for assets with both turnover and DefiLlama settlement-capacity data.
+    # Unmapped assets remain NaN here and are therefore excluded from hybrid regressions.
+    out["objective_tradable_settlement_z"] = np.where(
+        out[turn_col].notna() & out["objective_settlement_capacity_z"].notna(),
+        0.5 * (out[turn_col] + out["objective_settlement_capacity_z"]),
+        np.nan,
+    )
+
+    out["_turnover_x_settlement_raw"] = out[turn_col] * out["objective_settlement_capacity_z"]
+    out["objective_turnover_x_settlement_z"] = out.groupby("event_id")["_turnover_x_settlement_raw"].transform(zscore)
+    out = out.drop(columns=["_turnover_x_settlement_raw"], errors="ignore")
+    return out
+
+
+# =========================================================
+# PortWatch mechanism data
+# =========================================================
+
+def resolve_existing_file(candidates: List[str], label: str) -> Optional[str]:
+    for p in candidates:
+        if p and Path(p).exists():
+            return str(Path(p))
+    print(f"[warning] {label} file not found. PortWatch tables will be empty.")
+    return None
+
+
+def load_portwatch_csv(path: str, kind: str) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    required_cols = ["DateTime", "Container", "Dry Bulk", "General Cargo", "Roll-on/roll-off", "Tanker", "7-day Moving Average", "Prior Year: 7-day Moving Average"]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise RuntimeError(f"{kind} CSV missing columns: {missing}")
+    df = df.copy()
+    df["DateTime"] = pd.to_datetime(df["DateTime"], utc=True, errors="coerce")
+    df = df.dropna(subset=["DateTime"]).sort_values("DateTime").reset_index(drop=True)
+    vessel_cols = ["Container", "Dry Bulk", "General Cargo", "Roll-on/roll-off", "Tanker"]
+    for c in vessel_cols + ["7-day Moving Average", "Prior Year: 7-day Moving Average"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["Total"] = df[vessel_cols].sum(axis=1, skipna=True)
+    df["kind"] = kind
+    return df
+
+
+def _window_change(df: pd.DataFrame, value_col: str, t: pd.Timestamp, window_days: int, baseline_days: int = 30) -> Tuple[float, float, float, int, int]:
+    ew0, ew1 = t - pd.Timedelta(days=window_days), t + pd.Timedelta(days=window_days)
+    bw0, bw1 = t - pd.Timedelta(days=baseline_days), t - pd.Timedelta(days=window_days + 1)
+    event_slice = df.loc[(df["DateTime"] >= ew0) & (df["DateTime"] <= ew1), value_col].dropna()
+    base_slice = df.loc[(df["DateTime"] >= bw0) & (df["DateTime"] <= bw1), value_col].dropna()
+    event_mean = event_slice.mean() if len(event_slice) else np.nan
+    base_mean = base_slice.mean() if len(base_slice) else np.nan
+    change = np.nan if pd.isna(event_mean) or pd.isna(base_mean) or base_mean == 0 else event_mean / base_mean - 1.0
+    return change, event_mean, base_mean, len(event_slice), len(base_slice)
+
+
+def compute_portwatch_metrics(events: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    arr_path = resolve_existing_file(cfg.portwatch_arrivals_candidates, "PortWatch arrivals")
+    vol_path = resolve_existing_file(cfg.portwatch_volume_candidates, "PortWatch volume")
+    if arr_path is None or vol_path is None:
+        return pd.DataFrame()
+    arrivals = load_portwatch_csv(arr_path, "arrivals")
+    volume = load_portwatch_csv(vol_path, "volume")
+    rows = []
+    for _, ev in events.iterrows():
+        t = utc(ev["event_date"]).floor("D")
+        w = int(ev.get("portwatch_window_days", 3))
+        arr_tanker, _, _, arr_to, arr_bo = _window_change(arrivals, "Tanker", t, w)
+        arr_total, _, _, arr_t, arr_b = _window_change(arrivals, "Total", t, w)
+        vol_tanker, _, _, vol_to, vol_bo = _window_change(volume, "Tanker", t, w)
+        vol_total, _, _, vol_t, vol_b = _window_change(volume, "Total", t, w)
+        mean_change = np.nanmean([arr_tanker, arr_total, vol_tanker, vol_total])
+        rows.append({
+            "event_id": ev["event_id"], "event_date": t, "event_type": ev["event_type"],
+            "arrivals_tanker_change": arr_tanker, "arrivals_total_change": arr_total,
+            "volume_tanker_change": vol_tanker, "volume_total_change": vol_total,
+            "shipping_disruption_index": -mean_change if pd.notna(mean_change) else np.nan,
+            "portwatch_complete": all(pd.notna(x) for x in [arr_tanker, arr_total, vol_tanker, vol_total]),
+        })
+    return pd.DataFrame(rows)
+
+
+# =========================================================
+# Stablecoin USD peg diagnostics
+# =========================================================
+
+def build_stablecoin_peg_volume_table(events: pd.DataFrame, stable_panel: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    """Build event-level USDC/USD and USDT/USD peg and volume diagnostics.
+
+    The peg diagnostic uses direct USD prices from CoinGecko and no longer
+    relies on a stablecoin cross-pair. This avoids mixing USDC peg behavior
+    with movements in the quote stablecoin.
+
+    Reported peg variables:
+    - max_usdc_peg_dev = max |USDC/USD - 1| within the event window
+    - max_usdt_peg_dev = max |USDT/USD - 1| within the event window
+    - max_major_stablecoin_peg_dev = max(max_usdc_peg_dev, max_usdt_peg_dev)
+
+    These are peg-stress diagnostics, not direct measures of stablecoin
+    settlement demand.
+    """
+    empty_cols = [
+        "event_id", "event_date",
+        "max_usdc_peg_dev", "max_usdt_peg_dev", "max_major_stablecoin_peg_dev",
+        "peg_stable_le_10bps", "major_stablecoins_stable_le_10bps",
+        "usdc_usd_volume_abnormal_z", "usdt_usd_volume_abnormal_z",
+        "stable_abnormal_volume_pct", "stable_abnormal_volume_z",
+        "peg_price_source", "peg_volume_interpretation",
+    ]
+    if stable_panel is None or stable_panel.empty:
+        return pd.DataFrame(columns=empty_cols)
+
+    sp = stable_panel.copy()
+    sp["date"] = pd.to_datetime(sp["date"], utc=True, errors="coerce").dt.floor("D")
+    sp["price"] = pd.to_numeric(sp["price"], errors="coerce")
+    sp["volume"] = pd.to_numeric(sp["volume"], errors="coerce")
+    sp["market_cap"] = pd.to_numeric(sp["market_cap"], errors="coerce")
+    sp = sp.dropna(subset=["date"])
+
+    peg_start = events["event_date"].min() - pd.Timedelta(days=cfg.peg_baseline_days + 10)
+    peg_end = cfg.effective_data_end_date + pd.Timedelta(days=1)
+
+    def _build_direct_usd_panel(stable_symbol: str, prefix: str) -> pd.DataFrame:
+        z = sp[
+            (sp["stable_symbol"] == stable_symbol)
+            & (sp["date"] >= utc(peg_start).floor("D"))
+            & (sp["date"] <= utc(peg_end).floor("D"))
+        ].copy()
+        if z.empty:
+            return pd.DataFrame(columns=[
+                "date", f"{prefix}_usd_price", f"{prefix}_usd_volume",
+                f"{prefix}_usd_market_cap", f"{prefix}_peg_dev_abs",
+            ])
+        z = (
+            z.groupby("date", as_index=False)
+            .agg(
+                **{
+                    f"{prefix}_usd_price": ("price", "last"),
+                    f"{prefix}_usd_volume": ("volume", "sum"),
+                    f"{prefix}_usd_market_cap": ("market_cap", "last"),
+                }
+            )
+            .sort_values("date")
+            .reset_index(drop=True)
+        )
+        z[f"{prefix}_peg_dev_abs"] = (z[f"{prefix}_usd_price"] - 1.0).abs()
+        return z
+
+    usdc = _build_direct_usd_panel("USDC", "usdc")
+    usdt = _build_direct_usd_panel("USDT", "usdt")
+
+    total_stable = (
+        sp.groupby("date", as_index=False)
+        .agg(stable_volume=("volume", "sum"), stable_mcap=("market_cap", "sum"))
+        .sort_values("date")
+        .reset_index(drop=True)
+    )
+
+    def _event_stable_stats(panel: pd.DataFrame, prefix: str, t: pd.Timestamp, w: int) -> Tuple[float, float]:
+        if panel is None or panel.empty:
+            return np.nan, np.nan
+        peg_slice = panel[(panel["date"] >= t) & (panel["date"] <= t + pd.Timedelta(days=w))]
+        base_slice = panel[
+            (panel["date"] >= t - pd.Timedelta(days=cfg.peg_baseline_days))
+            & (panel["date"] <= t - pd.Timedelta(days=w + 1))
+        ]
+        dev_col = f"{prefix}_peg_dev_abs"
+        vol_col = f"{prefix}_usd_volume"
+        max_dev = peg_slice[dev_col].max() if not peg_slice.empty and dev_col in peg_slice.columns else np.nan
+        daily_equiv = peg_slice[vol_col].mean() if not peg_slice.empty and vol_col in peg_slice.columns else np.nan
+        base_mean = base_slice[vol_col].mean() if not base_slice.empty and vol_col in base_slice.columns else np.nan
+        base_std = base_slice[vol_col].std(ddof=0) if not base_slice.empty and vol_col in base_slice.columns else np.nan
+        vol_z = np.nan if pd.isna(base_std) or base_std == 0 else (daily_equiv - base_mean) / base_std
+        return max_dev, vol_z
+
+    rows = []
+    for _, ev in events.iterrows():
+        t = utc(ev["event_date"]).floor("D")
+        w = int(ev.get("peg_window_days", 3))
+
+        max_usdc_dev, usdc_usd_vol_z = _event_stable_stats(usdc, "usdc", t, w)
+        max_usdt_dev, usdt_usd_vol_z = _event_stable_stats(usdt, "usdt", t, w)
+
+        dev_candidates = [x for x in [max_usdc_dev, max_usdt_dev] if pd.notna(x)]
+        max_major_dev = max(dev_candidates) if dev_candidates else np.nan
+        both_major_available = pd.notna(max_usdc_dev) and pd.notna(max_usdt_dev)
+        major_stable = bool(both_major_available and pd.notna(max_major_dev) and max_major_dev <= 0.001)
+
+        stable_abn_pct, stable_abn_z = np.nan, np.nan
+        if not total_stable.empty:
+            es = total_stable[
+                (total_stable["date"] >= t)
+                & (total_stable["date"] <= t + pd.Timedelta(days=w))
+            ]["stable_volume"].dropna()
+            bs = total_stable[
+                (total_stable["date"] >= t - pd.Timedelta(days=cfg.stable_baseline_days))
+                & (total_stable["date"] <= t - pd.Timedelta(days=w + 1))
+            ]["stable_volume"].dropna()
+            if len(es) and len(bs) and bs.mean() != 0:
+                stable_abn_pct = es.mean() / bs.mean() - 1.0
+                stable_abn_z = (
+                    (es.mean() - bs.mean()) / bs.std(ddof=0)
+                    if bs.std(ddof=0) != 0
+                    else np.nan
+                )
+
+        max_major_vol_z = np.nanmax([usdc_usd_vol_z, usdt_usd_vol_z]) if any(pd.notna(x) for x in [usdc_usd_vol_z, usdt_usd_vol_z]) else np.nan
+        if major_stable and pd.notna(max_major_vol_z) and max_major_vol_z > 2:
+            interp = "major USD stablecoins remain within 10 bps; elevated stablecoin volume"
+        elif major_stable:
+            interp = "major USD stablecoins remain within 10 bps with no strong volume stress"
+        elif pd.notna(max_major_dev):
+            interp = "possible major USD stablecoin peg stress"
+        else:
+            interp = "stablecoin USD peg diagnostic unavailable"
+
+        rows.append({
+            "event_id": ev["event_id"],
+            "event_date": t,
+            "max_usdc_peg_dev": max_usdc_dev,
+            "max_usdt_peg_dev": max_usdt_dev,
+            "max_major_stablecoin_peg_dev": max_major_dev,
+            # Backward-compatible alias: now interpreted as the joint USDC/USD and USDT/USD diagnostic.
+            "peg_stable_le_10bps": major_stable,
+            "major_stablecoins_stable_le_10bps": major_stable,
+            "usdc_usd_volume_abnormal_z": usdc_usd_vol_z,
+            "usdt_usd_volume_abnormal_z": usdt_usd_vol_z,
+            "stable_abnormal_volume_pct": stable_abn_pct,
+            "stable_abnormal_volume_z": stable_abn_z,
+            "peg_price_source": "CoinGecko USDC/USD and USDT/USD",
+            "peg_volume_interpretation": interp,
+        })
+
+    return pd.DataFrame(rows)
+
+
+# =========================================================
+# Objective exposure construction
+# =========================================================
+
+def summarize_pre_event_objective_metrics(events: pd.DataFrame, asset_symbols: List[str], price_panel: pd.DataFrame, cm_panel: pd.DataFrame, artemis_panel: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    rows = []
+    price = price_panel.copy()
+    for _, ev in events.iterrows():
+        t = utc(ev["event_date"]).floor("D")
+        pre_end = t - pd.Timedelta(days=cfg.objective_gap_days)
+        pre_start = pre_end - pd.Timedelta(days=cfg.objective_pre_days - 1)
+        for sym in asset_symbols:
+            pz = price[(price["symbol"] == sym) & (price["date"] >= pre_start) & (price["date"] <= pre_end)].copy()
+            mean_mcap = pz["market_cap"].mean() if not pz.empty else np.nan
+            sum_vol = pz["volume"].sum() if not pz.empty else np.nan
+            mean_vol = pz["volume"].mean() if not pz.empty else np.nan
+            cg_turnover = np.nan if pd.isna(mean_mcap) or mean_mcap <= 0 else sum_vol / mean_mcap
+
+            cz = cm_panel[(cm_panel["symbol"] == sym) & (cm_panel["date"] >= pre_start) & (cm_panel["date"] <= pre_end)].copy() if cm_panel is not None and not cm_panel.empty else pd.DataFrame()
+            tx_val_sum = cz["TxTfrValAdjUSD"].sum(min_count=1) if not cz.empty and "TxTfrValAdjUSD" in cz else np.nan
+            active_mean = cz["AdrActCnt"].mean() if not cz.empty and "AdrActCnt" in cz else np.nan
+            txcnt_sum = cz["TxCnt"].sum(min_count=1) if not cz.empty and "TxCnt" in cz else np.nan
+            cm_obs = int(cz[[c for c in CM_METRICS if c in cz.columns]].notna().any(axis=1).sum()) if not cz.empty else 0
+
+            transfer_mcap = np.nan if pd.isna(tx_val_sum) or pd.isna(mean_mcap) or mean_mcap <= 0 else tx_val_sum / mean_mcap
+            active_per_billion = np.nan if pd.isna(active_mean) or pd.isna(mean_mcap) or mean_mcap <= 0 else active_mean / (mean_mcap / 1e9)
+            txcnt_per_billion = np.nan if pd.isna(txcnt_sum) or pd.isna(mean_mcap) or mean_mcap <= 0 else txcnt_sum / (mean_mcap / 1e9)
+
+            az = artemis_panel[(artemis_panel["symbol"] == sym) & (artemis_panel["date"] >= pre_start) & (artemis_panel["date"] <= pre_end)].copy() if artemis_panel is not None and not artemis_panel.empty else pd.DataFrame()
+            art_sum = az["p2p_stablecoin_transfer_volume"].sum(min_count=1) if not az.empty else np.nan
+            art_ratio = np.nan if pd.isna(art_sum) or pd.isna(mean_mcap) or mean_mcap <= 0 else art_sum / mean_mcap
+
+            rows.append({
+                "event_id": ev["event_id"], "event_date": t, "symbol": sym,
+                "objective_window_start": pre_start, "objective_window_end": pre_end,
+                "mean_mcap_90d": mean_mcap, "sum_exchange_volume_90d": sum_vol, "mean_exchange_volume_90d": mean_vol,
+                "cg_exchange_turnover_mcap_90d": cg_turnover,
+                "cm_TxTfrValAdjUSD_sum_90d": tx_val_sum,
+                "cm_AdrActCnt_mean_90d": active_mean,
+                "cm_TxCnt_sum_90d": txcnt_sum,
+                "cm_obs_days_90d": cm_obs,
+                "cm_transfer_mcap_ratio_90d": transfer_mcap,
+                "cm_activeaddr_per_billion_mcap_90d": active_per_billion,
+                "cm_txcnt_per_billion_mcap_90d": txcnt_per_billion,
+                "artemis_p2p_stablecoin_transfer_sum_90d": art_sum,
+                "artemis_stablecoin_mcap_ratio_90d": art_ratio,
+                "use_case_group": ASSET_MASTER[sym]["group"],
+            })
+    out = pd.DataFrame(rows)
+    # Transform skewed ratios. Z-score within each event/episode to focus on cross-sectional exposure.
+    log_cols = {
+        "cm_transfer_mcap_ratio_90d": "log_cm_transfer_mcap_ratio_90d",
+        "cm_activeaddr_per_billion_mcap_90d": "log_cm_activeaddr_per_billion_mcap_90d",
+        "cm_txcnt_per_billion_mcap_90d": "log_cm_txcnt_per_billion_mcap_90d",
+        "cg_exchange_turnover_mcap_90d": "log_cg_exchange_turnover_mcap_90d",
+        "artemis_stablecoin_mcap_ratio_90d": "log_artemis_stablecoin_mcap_ratio_90d",
+    }
+    for raw, logc in log_cols.items():
+        out[logc] = np.log1p(pd.to_numeric(out[raw], errors="coerce").clip(lower=0))
+        out[logc + "_z"] = out.groupby("event_id")[logc].transform(zscore)
+
+    onchain_components = [
+        "log_cm_transfer_mcap_ratio_90d_z",
+        "log_cm_activeaddr_per_billion_mcap_90d_z",
+        "log_cm_txcnt_per_billion_mcap_90d_z",
+    ]
+    broad_components = onchain_components + ["log_cg_exchange_turnover_mcap_90d_z"]
+    artemis_col = "log_artemis_stablecoin_mcap_ratio_90d_z"
+
+    out["objective_onchain_composite_z"] = out[onchain_components].mean(axis=1, skipna=True)
+    out["objective_broad_composite_z"] = out[broad_components].mean(axis=1, skipna=True)
+    # Main variable: Artemis stablecoin exposure if available; otherwise on-chain composite; otherwise broad fallback.
+    out["objective_primary_z"] = out[artemis_col]
+    out.loc[out["objective_primary_z"].isna(), "objective_primary_z"] = out.loc[out["objective_primary_z"].isna(), "objective_onchain_composite_z"]
+    out.loc[out["objective_primary_z"].isna(), "objective_primary_z"] = out.loc[out["objective_primary_z"].isna(), "objective_broad_composite_z"]
+    out["objective_source"] = np.where(out[artemis_col].notna(), "artemis_p2p_stablecoin",
+                               np.where(out["objective_onchain_composite_z"].notna(), "coinmetrics_onchain", "coingecko_turnover_fallback"))
+    return out
+
+
+# =========================================================
+# CAR / event-asset panel
+# =========================================================
+
+def _compute_car(win: pd.DataFrame, beta: np.ndarray) -> float:
+    if win.empty:
+        return np.nan
+    Xw = np.column_stack([np.ones(len(win)), win.iloc[:, 1].values])
+    ar = win.iloc[:, 0].values - Xw @ beta
+    return float(np.nansum(ar))
+
+
+def build_event_asset_panel(events: pd.DataFrame, asset_symbols: List[str], price_panel: pd.DataFrame, exposure_df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    ret = price_panel.pivot(index="date", columns="symbol", values="ret").sort_index()
+    mcap = price_panel.pivot(index="date", columns="symbol", values="market_cap").sort_index()
+    vol = price_panel.pivot(index="date", columns="symbol", values="volume").sort_index()
+    px = price_panel.pivot(index="date", columns="symbol", values="price").sort_index()
+    rows = []
+    data_end = utc(cfg.effective_data_end_date).floor("D")
+    for _, ev in events.iterrows():
+        t = utc(ev["event_date"]).floor("D")
+        k = int(ev.get("car_post_days", cfg.default_event_car_days))
+        for sym in asset_symbols:
+            if sym not in ret.columns:
+                continue
+            y = ret[sym]
+            others = [c for c in asset_symbols if c != sym and c in ret.columns]
+            if not others:
+                continue
+            mkt = ret[others].mean(axis=1, skipna=True)
+            est_start = t - pd.Timedelta(days=cfg.estimation_pre_days)
+            est_end = t - pd.Timedelta(days=cfg.estimation_gap_days)
+            est = pd.concat([y, mkt], axis=1).loc[(ret.index >= est_start) & (ret.index <= est_end)].dropna()
+            if len(est) < 20:
+                continue
+            X = np.column_stack([np.ones(len(est)), est.iloc[:, 1].values])
+            beta = np.linalg.lstsq(X, est.iloc[:, 0].values, rcond=None)[0]
+
+            has_full = add_days(t, k) <= data_end
+            car = np.nan
+            if has_full:
+                w0, w1 = t, t + pd.Timedelta(days=k)
+                win = pd.concat([y, mkt], axis=1).loc[(ret.index >= w0) & (ret.index <= w1)].dropna()
+                if len(win) >= k + 1:
+                    car = _compute_car(win, beta)
+            pre_start = t - pd.Timedelta(days=10)
+            pre_end = t - pd.Timedelta(days=1)
+            pre_mcap = mcap[sym].loc[(mcap.index >= pre_start) & (mcap.index <= pre_end)].dropna() if sym in mcap.columns else pd.Series(dtype=float)
+            pre_vol = vol[sym].loc[(vol.index >= pre_start) & (vol.index <= pre_end)].dropna() if sym in vol.columns else pd.Series(dtype=float)
+            pre_ret = y.loc[(ret.index >= pre_start) & (ret.index <= pre_end)].dropna()
+            rows.append({
+                "event_id": ev["event_id"], "event_date": t, "event_type": ev["event_type"], "event_weight": ev.get("event_weight", np.nan), "event_name": ev.get("event_name", ""),
+                "placebo_sim": ev.get("placebo_sim", np.nan),
+                "symbol": sym, "asset_name": sym.replace("USDT", ""), "car_post_days_used": k, "car_has_full_post_window": has_full,
+                "car_event_window": car, "car_event_window_bps": np.nan if pd.isna(car) else car * 10000,
+                "pre_log_mcap": np.log(pre_mcap.mean()) if len(pre_mcap) and pre_mcap.mean() > 0 else np.nan,
+                "pre_log_volume": np.log(pre_vol.mean()) if len(pre_vol) and pre_vol.mean() > 0 else np.nan,
+                "pre_volatility": pre_ret.std(ddof=0) if len(pre_ret) > 1 else np.nan,
+                "pre_beta": float(beta[1]) if len(beta) > 1 else np.nan,
+                "pre_turnover": float((pre_vol / pre_mcap).mean()) if len(pre_mcap) and len(pre_vol) else np.nan, "use_case_group": ASSET_MASTER[sym]["group"],
+            })
+    panel = pd.DataFrame(rows)
+    if panel.empty:
+        return panel
+    exp = exposure_df.drop(columns=["event_date"], errors="ignore")
+    panel = panel.merge(exp, on=["event_id", "symbol", "use_case_group"], how="left")
+    panel["car_event_window_winsor"] = panel.groupby("event_id")["car_event_window"].transform(lambda s: winsorize_series(s, 0.02, 0.98))
+    panel["car_event_window_event_z"] = panel.groupby("event_id")["car_event_window"].transform(zscore)
+    # WLS weight: more weight to liquid and less noisy assets. Clip to avoid one asset dominating.
+    raw_w = np.exp(panel["pre_log_mcap"].fillna(panel["pre_log_mcap"].median())) / (panel["pre_volatility"].fillna(panel["pre_volatility"].median()) ** 2 + 1e-6)
+    panel["w_liquidity_precision"] = raw_w / np.nanmedian(raw_w)
+    panel["w_liquidity_precision"] = panel["w_liquidity_precision"].clip(lower=0.2, upper=5.0)
+    return panel
+
+
+# =========================================================
+# Regression utilities
+# =========================================================
+
+def fit_model(formula: str, data: pd.DataFrame, cov_type: str = "HC1", cluster_col: Optional[str] = None, weights_col: Optional[str] = None):
+    try:
+        d = data.copy()
+        if d.empty:
+            return None
+        if weights_col is not None and weights_col in d.columns:
+            model = smf.wls(formula, data=d, weights=d[weights_col].fillna(1.0)).fit()
+        else:
+            model = smf.ols(formula, data=d).fit()
+        if cov_type == "cluster" and cluster_col is not None and cluster_col in d.columns and d[cluster_col].nunique() >= 2:
+            return model.get_robustcov_results(cov_type="cluster", groups=d[cluster_col])
+        return model.get_robustcov_results(cov_type=cov_type)
+    except Exception as e:
+        if getattr(CFG, "verbose_download_logs", False):
+            print(f"[regression failed] {formula}: {e}")
+        return None
+
+
+def _params_index(model):
+    try:
+        return list(model.model.exog_names)
+    except Exception:
+        return list(model.params.index)
+
+
+def extract_terms(model, reg_df: pd.DataFrame, model_name: str, dep_var: str, terms: List[str]) -> pd.DataFrame:
+    names = _params_index(model) if model is not None else []
+    rows = []
+    for term in terms:
+        if model is None or term not in names:
+            rows.append({"model_name": model_name, "dep_var": dep_var, "term": term, "coef": np.nan, "std_err": np.nan, "t": np.nan, "p_value": np.nan, "n_obs": len(reg_df) if reg_df is not None else 0, "n_events": reg_df["event_id"].nunique() if reg_df is not None and "event_id" in reg_df else 0, "n_assets": reg_df["symbol"].nunique() if reg_df is not None and "symbol" in reg_df else 0})
+        else:
+            idx = names.index(term)
+            rows.append({
+                "model_name": model_name, "dep_var": dep_var, "term": term,
+                "coef": float(model.params[idx]), "std_err": float(model.bse[idx]), "t": float(model.tvalues[idx]), "p_value": float(model.pvalues[idx]),
+                "n_obs": int(model.nobs), "n_events": reg_df["event_id"].nunique() if "event_id" in reg_df else 0, "n_assets": reg_df["symbol"].nunique() if "symbol" in reg_df else 0,
+            })
+    return pd.DataFrame(rows)
+
+
+def run_objective_specs(panel: pd.DataFrame, label: str) -> pd.DataFrame:
+    d = panel.dropna(subset=["car_event_window"]).copy()
+    out = []
+    specs = [
+        ("TURNOVER_raw_FE_HC1", "car_event_window ~ log_cg_exchange_turnover_mcap_90d_z + C(event_id)", "car_event_window", ["log_cg_exchange_turnover_mcap_90d_z"], None, "HC1", None),
+        ("TURNOVER_symbol_cluster", "car_event_window ~ log_cg_exchange_turnover_mcap_90d_z + C(event_id)", "car_event_window", ["log_cg_exchange_turnover_mcap_90d_z"], None, "cluster", "symbol"),
+        ("TURNOVER_controls_FE_HC1", "car_event_window ~ log_cg_exchange_turnover_mcap_90d_z + pre_log_mcap + pre_log_volume + pre_volatility + pre_beta + C(event_id)", "car_event_window", ["log_cg_exchange_turnover_mcap_90d_z"], None, "HC1", None),
+        ("MAIN_raw_FE_HC1", "car_event_window ~ objective_primary_z + C(event_id)", "car_event_window", ["objective_primary_z"], None, "HC1", None),
+        ("MAIN_raw_symbol_cluster", "car_event_window ~ objective_primary_z + C(event_id)", "car_event_window", ["objective_primary_z"], None, "cluster", "symbol"),
+        ("MAIN_winsor_FE_HC1", "car_event_window_winsor ~ objective_primary_z + C(event_id)", "car_event_window_winsor", ["objective_primary_z"], None, "HC1", None),
+        ("MAIN_event_z_FE_HC1", "car_event_window_event_z ~ objective_primary_z + C(event_id)", "car_event_window_event_z", ["objective_primary_z"], None, "HC1", None),
+        ("MAIN_WLS_liquidity_precision", "car_event_window ~ objective_primary_z + C(event_id)", "car_event_window", ["objective_primary_z"], "w_liquidity_precision", "HC1", None),
+        ("MAIN_controls_FE_HC1", "car_event_window ~ objective_primary_z + pre_log_mcap + pre_log_volume + pre_volatility + pre_beta + C(event_id)", "car_event_window", ["objective_primary_z"], None, "HC1", None),
+        ("SETTLE_capacity_FE_HC1", "car_event_window ~ objective_settlement_capacity_z + C(event_id)", "car_event_window", ["objective_settlement_capacity_z"], None, "HC1", None),
+        ("SETTLE_capacity_symbol_cluster", "car_event_window ~ objective_settlement_capacity_z + C(event_id)", "car_event_window", ["objective_settlement_capacity_z"], None, "cluster", "symbol"),
+        ("SETTLE_capacity_controls_FE_HC1", "car_event_window ~ objective_settlement_capacity_z + pre_log_mcap + pre_log_volume + pre_volatility + pre_beta + C(event_id)", "car_event_window", ["objective_settlement_capacity_z"], None, "HC1", None),
+        ("SETTLE_growth_FE_HC1", "car_event_window ~ objective_settlement_growth_z + C(event_id)", "car_event_window", ["objective_settlement_growth_z"], None, "HC1", None),
+        ("HYBRID_tradable_settlement_FE_HC1", "car_event_window ~ objective_tradable_settlement_z + C(event_id)", "car_event_window", ["objective_tradable_settlement_z"], None, "HC1", None),
+        ("HYBRID_turnover_x_settlement_FE_HC1", "car_event_window ~ objective_turnover_x_settlement_z + C(event_id)", "car_event_window", ["objective_turnover_x_settlement_z"], None, "HC1", None),
+        ("OBJ_onchain_composite", "car_event_window ~ objective_onchain_composite_z + C(event_id)", "car_event_window", ["objective_onchain_composite_z"], None, "HC1", None),
+        ("OBJ_broad_composite", "car_event_window ~ objective_broad_composite_z + C(event_id)", "car_event_window", ["objective_broad_composite_z"], None, "HC1", None),
+    ]
+    for name, formula, dep, terms, weights, cov, cluster in specs:
+        if dep not in d.columns or any(term not in d.columns for term in terms):
+            continue
+        needed = terms + [dep]
+        for maybe in ["pre_log_mcap", "pre_log_volume", "pre_volatility", "pre_beta", weights]:
+            if maybe and maybe in formula and maybe in d.columns:
+                needed.append(maybe)
+        dd = d.dropna(subset=list(dict.fromkeys([c for c in needed if c in d.columns]))).copy()
+        if len(dd) < 10 or dd["symbol"].nunique() < 5:
+            continue
+        model = fit_model(formula, dd, cov_type=cov, cluster_col=cluster, weights_col=weights)
+        res = extract_terms(model, dd, f"{label}_{name}", dep, terms)
+        res.insert(0, "sample", label)
+        out.append(res)
+    return pd.concat(out, ignore_index=True) if out else pd.DataFrame()
+
+
+def run_leave_one_asset(panel: pd.DataFrame, label: str, xvar: str = "objective_primary_z") -> pd.DataFrame:
+    base = panel.dropna(subset=["car_event_window", xvar]).copy()
+    base_model = fit_model(f"car_event_window ~ {xvar} + C(event_id)", base, cov_type="HC1")
+    base_res = extract_terms(base_model, base, "baseline", "car_event_window", [xvar])
+    base_coef = base_res.loc[0, "coef"] if not base_res.empty else np.nan
+    rows = []
+    for sym in sorted(base["symbol"].unique()):
+        dd = base[base["symbol"] != sym].copy()
+        if len(dd) < 10:
+            continue
+        model = fit_model(f"car_event_window ~ {xvar} + C(event_id)", dd, cov_type="HC1")
+        res = extract_terms(model, dd, f"drop_{sym}", "car_event_window", [xvar]).iloc[0].to_dict()
+        res["sample"] = label
+        res["dropped_asset"] = sym
+        res["baseline_coef"] = base_coef
+        res["coef_change"] = res["coef"] - base_coef if pd.notna(base_coef) and pd.notna(res["coef"]) else np.nan
+        rows.append(res)
+    return pd.DataFrame(rows).sort_values("coef_change", key=lambda s: s.abs(), ascending=False) if rows else pd.DataFrame()
+
+
+def run_interaction_specs(event_panel: pd.DataFrame, portwatch: pd.DataFrame, pegvol: pd.DataFrame) -> pd.DataFrame:
+    d = event_panel.copy()
+    if portwatch is not None and not portwatch.empty:
+        d = d.merge(portwatch[["event_id", "shipping_disruption_index"]], on="event_id", how="left")
+        d["shipping_disruption_z"] = zscore(d.drop_duplicates("event_id").set_index("event_id")["shipping_disruption_index"]).reindex(d["event_id"]).values
+    if pegvol is not None and not pegvol.empty:
+        peg_cols = ["event_id", "stable_abnormal_volume_z", "usdc_usd_volume_abnormal_z", "usdt_usd_volume_abnormal_z"]
+        peg_cols = [c for c in peg_cols if c in pegvol.columns]
+        d = d.merge(pegvol[peg_cols], on="event_id", how="left")
+        for c in ["stable_abnormal_volume_z", "usdc_usd_volume_abnormal_z", "usdt_usd_volume_abnormal_z"]:
+            if c in d.columns:
+                tmp = d.drop_duplicates("event_id").set_index("event_id")[c]
+                d[c + "_event_z"] = zscore(tmp).reindex(d["event_id"]).values
+    out = []
+    specs = [
+        ("INT_objective_x_shipping", "car_event_window ~ objective_primary_z + objective_primary_z:shipping_disruption_z + C(event_id)", ["objective_primary_z", "objective_primary_z:shipping_disruption_z"]),
+        ("INT_objective_x_stable_volume", "car_event_window ~ objective_primary_z + objective_primary_z:stable_abnormal_volume_z_event_z + C(event_id)", ["objective_primary_z", "objective_primary_z:stable_abnormal_volume_z_event_z"]),
+        ("INT_objective_x_usdc_volume", "car_event_window ~ objective_primary_z + objective_primary_z:usdc_usd_volume_abnormal_z_event_z + C(event_id)", ["objective_primary_z", "objective_primary_z:usdc_usd_volume_abnormal_z_event_z"]),
+        ("INT_objective_x_usdt_volume", "car_event_window ~ objective_primary_z + objective_primary_z:usdt_usd_volume_abnormal_z_event_z + C(event_id)", ["objective_primary_z", "objective_primary_z:usdt_usd_volume_abnormal_z_event_z"]),
+    ]
+    for name, formula, terms in specs:
+        needed_terms = ["car_event_window", "objective_primary_z"]
+        if "shipping" in name:
+            needed_terms.append("shipping_disruption_z")
+        if "stable_volume" in name:
+            needed_terms.append("stable_abnormal_volume_z_event_z")
+        if "usdc_volume" in name:
+            needed_terms.append("usdc_usd_volume_abnormal_z_event_z")
+        if "usdt_volume" in name:
+            needed_terms.append("usdt_usd_volume_abnormal_z_event_z")
+        dd = d.dropna(subset=needed_terms).copy()
+        if len(dd) < 20 or dd["event_id"].nunique() < 3:
+            continue
+        model = fit_model(formula, dd, cov_type="HC1")
+        out.append(extract_terms(model, dd, name, "car_event_window", terms))
+    return pd.concat(out, ignore_index=True) if out else pd.DataFrame()
+
+
+# =========================================================
+# Diagnostics and summaries
+# =========================================================
+
+def build_objective_coverage_summary(exposure: pd.DataFrame) -> pd.DataFrame:
+    vars_ = [
+        "artemis_stablecoin_mcap_ratio_90d",
+        "cm_transfer_mcap_ratio_90d",
+        "cm_activeaddr_per_billion_mcap_90d",
+        "cm_txcnt_per_billion_mcap_90d",
+        "cg_exchange_turnover_mcap_90d",
+        "dl_stablecoin_mcap_ratio_90d",
+        "dl_stablecoin_mcap_change_90d",
+        "objective_settlement_capacity_z",
+        "objective_settlement_growth_z",
+        "objective_tradable_settlement_z",
+        "objective_tradable_settlement_fullsample_z",
+        "objective_turnover_x_settlement_z",
+        "objective_onchain_composite_z",
+        "objective_broad_composite_z",
+        "objective_primary_z",
+    ]
+    rows = []
+    for v in vars_:
+        if v in exposure.columns:
+            rows.append({"variable": v, "non_missing_obs": int(exposure[v].notna().sum()), "coverage_pct": float(exposure[v].notna().mean() * 100), "n_events": exposure.loc[exposure[v].notna(), "event_id"].nunique(), "n_assets": exposure.loc[exposure[v].notna(), "symbol"].nunique()})
+    source = exposure.groupby("objective_source", dropna=False).agg(n_obs=("symbol", "size"), n_assets=("symbol", "nunique"), n_events=("event_id", "nunique")).reset_index() if "objective_source" in exposure else pd.DataFrame()
+    return pd.DataFrame(rows), source
+
+
+def build_objective_snapshot(exposure: pd.DataFrame, event_id: str, top_n: int = 8) -> pd.DataFrame:
+    d = exposure[exposure["event_id"] == event_id].copy()
+    cols = ["symbol", "use_case_group", "objective_primary_z", "objective_source", "cm_transfer_mcap_ratio_90d", "cg_exchange_turnover_mcap_90d"]
+    hi = d.sort_values("objective_primary_z", ascending=False).head(top_n).copy()
+    lo = d.sort_values("objective_primary_z", ascending=True).head(top_n).copy()
+    hi.insert(0, "bucket", "highest_objective_exposure")
+    lo.insert(0, "bucket", "lowest_objective_exposure")
+    return pd.concat([hi, lo], ignore_index=True)[["bucket"] + cols]
+
+
+
+def build_key_metric_comparison(results: pd.DataFrame) -> pd.DataFrame:
+    """Compact comparison of turnover, settlement-capacity, and hybrid variables."""
+    if results is None or results.empty:
+        return pd.DataFrame()
+    keep = [
+        ("TURNOVER_raw_FE_HC1", "log_cg_exchange_turnover_mcap_90d_z", "Exchange turnover intensity"),
+        ("TURNOVER_symbol_cluster", "log_cg_exchange_turnover_mcap_90d_z", "Exchange turnover, symbol-clustered"),
+        ("TURNOVER_controls_FE_HC1", "log_cg_exchange_turnover_mcap_90d_z", "Exchange turnover + controls"),
+        ("SETTLE_capacity_FE_HC1", "objective_settlement_capacity_z", "DefiLlama stablecoin supply / mcap"),
+        ("SETTLE_capacity_symbol_cluster", "objective_settlement_capacity_z", "Stablecoin supply / mcap, clustered"),
+        ("SETTLE_capacity_controls_FE_HC1", "objective_settlement_capacity_z", "Stablecoin supply / mcap + controls"),
+        ("SETTLE_growth_FE_HC1", "objective_settlement_growth_z", "Stablecoin supply growth"),
+        ("HYBRID_tradable_settlement_FE_HC1", "objective_tradable_settlement_z", "Mapped-sample turnover + stablecoin supply composite"),
+        ("HYBRID_turnover_x_settlement_FE_HC1", "objective_turnover_x_settlement_z", "Turnover x stablecoin supply"),
+    ]
+    rows = []
+    for suffix, term, label in keep:
+        z = results[results["model_name"].str.endswith(suffix) & (results["term"] == term)].copy()
+        if z.empty:
+            continue
+        r = z.iloc[0]
+        rows.append({
+            "sample": r.get("sample", ""),
+            "metric": label,
+            "term": term,
+            "coef": r["coef"],
+            "std_err": r["std_err"],
+            "p_value": r["p_value"],
+            "n_obs": r["n_obs"],
+            "n_events": r["n_events"],
+            "n_assets": r["n_assets"],
+            "support": "significant +" if pd.notna(r["coef"]) and r["coef"] > 0 and r["p_value"] < 0.05 else ("positive, ns" if pd.notna(r["coef"]) and r["coef"] > 0 else "not supportive"),
+        })
+    return pd.DataFrame(rows)
+
+
+# =========================================================
+# Additional robustness helpers
+# =========================================================
+
+def add_rank_based_exposures(exposure: pd.DataFrame) -> pd.DataFrame:
+    """Add rank and tercile versions of the main exposure variables."""
+    out = exposure.copy()
+    rank_inputs = {
+        "turnover": "log_cg_exchange_turnover_mcap_90d",
+        "settlement_capacity": "log_dl_stablecoin_mcap_ratio_90d",
+        "hybrid": "objective_tradable_settlement_z",
+        "primary": "objective_primary_z",
+    }
+    for prefix, col in rank_inputs.items():
+        if col not in out.columns:
+            continue
+        out[f"{prefix}_rank_pct"] = out.groupby("event_id")[col].transform(lambda s: s.rank(pct=True))
+        out[f"{prefix}_top_tercile"] = (out[f"{prefix}_rank_pct"] >= 2.0 / 3.0).astype(float)
+        out.loc[out[f"{prefix}_rank_pct"].isna(), f"{prefix}_top_tercile"] = np.nan
+    return out
+
+
+def run_rank_and_exclusion_robustness(panel: pd.DataFrame, label: str) -> pd.DataFrame:
+    """Run rank, tercile, no-L2, and high-turnover-exclusion robustness checks."""
+    if panel is None or panel.empty:
+        return pd.DataFrame()
+    out = []
+    specs = [
+        ("RANK_turnover_pct", "car_event_window ~ turnover_rank_pct + C(event_id)", ["turnover_rank_pct"], None),
+        ("RANK_turnover_top_tercile", "car_event_window ~ turnover_top_tercile + C(event_id)", ["turnover_top_tercile"], None),
+        ("RANK_settlement_capacity_pct", "car_event_window ~ settlement_capacity_rank_pct + C(event_id)", ["settlement_capacity_rank_pct"], None),
+        ("RANK_hybrid_pct", "car_event_window ~ hybrid_rank_pct + C(event_id)", ["hybrid_rank_pct"], None),
+        ("NO_L2_turnover", "car_event_window ~ log_cg_exchange_turnover_mcap_90d_z + C(event_id)", ["log_cg_exchange_turnover_mcap_90d_z"], lambda d: ~d["symbol"].isin(["ARBUSDT", "OPUSDT"])),
+        ("NO_L2_settlement", "car_event_window ~ objective_settlement_capacity_z + C(event_id)", ["objective_settlement_capacity_z"], lambda d: ~d["symbol"].isin(["ARBUSDT", "OPUSDT"])),
+        ("NO_L2_hybrid", "car_event_window ~ objective_tradable_settlement_z + C(event_id)", ["objective_tradable_settlement_z"], lambda d: ~d["symbol"].isin(["ARBUSDT", "OPUSDT"])),
+    ]
+    d0 = panel.dropna(subset=["car_event_window"]).copy()
+    if "log_cg_exchange_turnover_mcap_90d" in d0.columns:
+        d0["turnover_within_event_rank_desc"] = d0.groupby("event_id")["log_cg_exchange_turnover_mcap_90d"].rank(ascending=False, method="first")
+        specs.extend([
+            ("EX_TOP2_TURNOVER_turnover", "car_event_window ~ log_cg_exchange_turnover_mcap_90d_z + C(event_id)", ["log_cg_exchange_turnover_mcap_90d_z"], lambda d: d["turnover_within_event_rank_desc"] > 2),
+            ("EX_TOP2_TURNOVER_hybrid", "car_event_window ~ objective_tradable_settlement_z + C(event_id)", ["objective_tradable_settlement_z"], lambda d: d["turnover_within_event_rank_desc"] > 2),
+        ])
+    for name, formula, terms, filt in specs:
+        dd = d0.copy()
+        if filt is not None:
+            try:
+                dd = dd.loc[filt(dd)].copy()
+            except Exception as e:
+                if getattr(CFG, "verbose_download_logs", False):
+                    print(f"[robustness filter failed] {name}: {e}")
+                continue
+        needed = list(dict.fromkeys(["car_event_window"] + terms))
+        dd = dd.dropna(subset=[c for c in needed if c in dd.columns]).copy()
+        if len(dd) < 10 or dd["symbol"].nunique() < 5:
+            continue
+        model = fit_model(formula, dd, cov_type="HC1")
+        res = extract_terms(model, dd, f"{label}_{name}", "car_event_window", terms)
+        res.insert(0, "sample", label)
+        out.append(res)
+    return pd.concat(out, ignore_index=True) if out else pd.DataFrame()
+
+
+def make_event_window_variants(events: pd.DataFrame, windows: List[int]) -> pd.DataFrame:
+    frames = []
+    for w in windows:
+        z = events.copy()
+        z["original_event_id"] = z["event_id"]
+        z["event_id"] = z["event_id"].astype(str) + f"_W{int(w)}"
+        z["car_post_days"] = int(w)
+        z["event_name"] = z["event_name"].astype(str) + f" [CAR 0-{int(w)}]"
+        frames.append(z)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def run_alternative_window_robustness(events: pd.DataFrame, loaded_assets: List[str], price_panel: pd.DataFrame, cm_panel: pd.DataFrame, artemis_panel: pd.DataFrame, defillama_panel: pd.DataFrame, cfg: Config, label: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    alt_events = make_event_window_variants(events, cfg.alternative_car_windows)
+    if alt_events.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    exposure_alt = summarize_pre_event_objective_metrics(alt_events, loaded_assets, price_panel, cm_panel, artemis_panel, cfg)
+    exposure_alt = augment_exposure_with_defillama_stable_metrics(exposure_alt, price_panel, defillama_panel, cfg)
+    exposure_alt = add_rank_based_exposures(exposure_alt)
+    panel_alt = build_event_asset_panel(alt_events, loaded_assets, price_panel, exposure_alt, cfg)
+    results_alt = run_objective_specs(panel_alt, label)
+    return panel_alt, results_alt
+
+
+
+
+def _placebo_config(cfg: Config) -> Config:
+    """Return the config used for placebo timing tests.
+
+    Pseudo-events are evaluated with the same pre-event exposure and
+    expected-return windows as the baseline seven-event specification: a 90-day
+    exposure window, a 60-day estimation window, and a six-day estimation gap.
+    This makes the actual coefficients and the placebo coefficient distribution
+    directly comparable in window length.
+    """
+    return replace(
+        cfg,
+        objective_pre_days=int(getattr(cfg, "placebo_objective_pre_days", 90)),
+        estimation_pre_days=int(getattr(cfg, "placebo_estimation_pre_days", 60)),
+        estimation_gap_days=int(getattr(cfg, "placebo_estimation_gap_days", 6)),
+        objective_gap_days=1,
+    )
+
+
+def build_random_placebo_event_sets(true_events: pd.DataFrame, price_panel: pd.DataFrame, cfg: Config, n_sims: Optional[int] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Build placebo event sets over non-event dates.
+
+    The returned placebo table has K pseudo-events per simulation, where K equals
+    the number of supplied true events. Candidate pseudo-event dates are required
+    to have enough pre-event history for the 90-day exposure window and the
+    60-day expected-return estimation window, and enough post-event data for the
+    largest CAR window. Diagnostics are returned so an empty placebo table can
+    be explained.
+    """
+    n_sims = int(n_sims or cfg.placebo_draws)
+    diag_rows = []
+    if true_events is None or true_events.empty or price_panel is None or price_panel.empty:
+        return pd.DataFrame(), pd.DataFrame([{"item": "placebo_input", "value": 0, "note": "true_events or price_panel is empty"}])
+
+    pcfg = _placebo_config(cfg)
+    dates = sorted(pd.to_datetime(price_panel["date"].dropna().unique(), utc=True))
+    dates = [utc(d).floor("D") for d in dates]
+    if not dates:
+        return pd.DataFrame(), pd.DataFrame([{"item": "price_dates", "value": 0, "note": "no usable price dates"}])
+
+    max_car = int(pd.to_numeric(true_events.get("car_post_days", cfg.default_event_car_days), errors="coerce").fillna(cfg.default_event_car_days).max())
+    min_allowed = min(dates) + pd.Timedelta(days=max(pcfg.objective_pre_days + pcfg.objective_gap_days + 2, pcfg.estimation_pre_days + pcfg.estimation_gap_days + 2))
+    max_allowed = utc(cfg.effective_data_end_date).floor("D") - pd.Timedelta(days=max_car + 1)
+    true_dates = [utc(x).floor("D") for x in true_events["event_date"].tolist()]
+    exclusion = int(getattr(cfg, "placebo_exclusion_days", 5))
+
+    candidates = []
+    for d in dates:
+        d = utc(d).floor("D")
+        if d < min_allowed or d > max_allowed:
+            continue
+        if any(abs((d - td).days) <= exclusion for td in true_dates):
+            continue
+        candidates.append(d)
+
+    diag_rows.extend([
+        {"item": "price_date_min", "value": str(min(dates).date()), "note": "available price panel start"},
+        {"item": "price_date_max", "value": str(max(dates).date()), "note": "available price panel end"},
+        {"item": "min_allowed_placebo_date", "value": str(min_allowed.date()), "note": f"uses {pcfg.objective_pre_days}d exposure and {pcfg.estimation_pre_days}d estimation windows"},
+        {"item": "max_allowed_placebo_date", "value": str(max_allowed.date()), "note": "keeps room for maximum CAR window"},
+        {"item": "true_event_exclusion_days", "value": exclusion, "note": "+/- days around true event dates"},
+        {"item": "candidate_placebo_dates", "value": len(candidates), "note": "non-event dates eligible for random sampling"},
+        {"item": "requested_placebo_draws", "value": n_sims, "note": "number of Monte Carlo placebo simulations"},
+    ])
+
+    # This diagnostic is deliberately explicit because placebo must match the
+    # event count of the design being benchmarked. For the seven-event robustness
+    # design it should be 7, not 9.
+    k_events = int(true_events["event_id"].nunique())
+    diag_rows.append({"item": "pseudo_events_per_draw", "value": k_events, "note": "number of pseudo-events in each placebo simulation; should match the benchmark design"})
+
+    if not candidates:
+        return pd.DataFrame(), pd.DataFrame(diag_rows)
+
+    rng = np.random.default_rng(cfg.placebo_seed)
+    replace_dates = len(candidates) < k_events
+    template = true_events.sort_values("event_date").reset_index(drop=True)
+    rows = []
+    successful = 0
+    for sim in range(1, n_sims + 1):
+        chosen = rng.choice(np.array(candidates, dtype="datetime64[ns]"), size=k_events, replace=replace_dates)
+        chosen = sorted(pd.Timestamp(x) for x in chosen)
+        successful += 1
+        for j, d in enumerate(chosen):
+            base = template.iloc[j % len(template)]
+            ts = pd.Timestamp(d)
+            ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+            rows.append({
+                "placebo_sim": sim,
+                "event_id": f"PL{sim:04d}_E{j+1:02d}",
+                "event_date": ts,
+                "event_type": "placebo_date",
+                "event_weight": 1.0,
+                "event_name": "Random non-event placebo date",
+                "car_post_days": int(base.get("car_post_days", cfg.default_event_car_days)),
+                "portwatch_window_days": int(base.get("portwatch_window_days", 3)),
+                "stable_window_days": int(base.get("stable_window_days", 7)),
+                "peg_window_days": int(base.get("peg_window_days", 3)),
+            })
+    diag_rows.append({"item": "successful_placebo_draws", "value": successful, "note": "simulations for which pseudo-event dates were drawn"})
+    return pd.DataFrame(rows), pd.DataFrame(diag_rows)
+
+
+def _fit_placebo_core(panel: pd.DataFrame, xvar: str, label: str) -> Optional[dict]:
+    """Fit one placebo event-FE CAR regression inside one simulation."""
+    if panel is None or panel.empty or xvar not in panel.columns:
+        return None
+    dd = panel.dropna(subset=["car_event_window", xvar]).copy()
+    # Use softer thresholds because settlement-capacity tests only cover 20 assets.
+    if len(dd) < 20 or dd["symbol"].nunique() < 8 or dd["event_id"].nunique() < 2:
+        return None
+    try:
+        model = fit_model(f"car_event_window ~ {xvar} + C(event_id)", dd, cov_type="HC1")
+        if model is None:
+            return None
+        names = _params_index(model)
+        if xvar not in names:
+            return None
+        idx = names.index(xvar)
+        return {
+            "placebo_sim": label,
+            "term": xvar,
+            "coef": float(model.params[idx]),
+            "std_err": float(model.bse[idx]),
+            "p_value": float(model.pvalues[idx]),
+            "n_obs": int(len(dd)),
+            "n_events": int(dd["event_id"].nunique()),
+            "n_assets": int(dd["symbol"].nunique()),
+        }
+    except Exception:
+        return None
+
+
+def _actual_coef_for_placebo(panel: pd.DataFrame, xvar: str) -> float:
+    if panel is None or panel.empty or xvar not in panel.columns:
+        return np.nan
+    dd = panel.dropna(subset=["car_event_window", xvar]).copy()
+    if len(dd) < 20 or dd["event_id"].nunique() < 2:
+        return np.nan
+    try:
+        model = fit_model(f"car_event_window ~ {xvar} + C(event_id)", dd, cov_type="HC1")
+        if model is None:
+            return np.nan
+        names = _params_index(model)
+        if xvar not in names:
+            return np.nan
+        return float(model.params[names.index(xvar)])
+    except Exception:
+        return np.nan
+
+
+def summarize_placebo_empirical(placebo_dist: pd.DataFrame, actual_panel: pd.DataFrame) -> pd.DataFrame:
+    """Summarize placebo coefficient distributions against the actual seven-event coefficient."""
+    if placebo_dist is None or placebo_dist.empty:
+        return pd.DataFrame()
+    labels = {
+        "log_cg_exchange_turnover_mcap_90d_z": "Exchange turnover intensity",
+        "objective_settlement_capacity_z": "DefiLlama stablecoin supply / mcap",
+        "objective_tradable_settlement_z": "Mapped-sample turnover + stablecoin supply composite",
+        "objective_turnover_x_settlement_z": "Turnover x stablecoin supply",
+    }
+    rows = []
+    for term, d in placebo_dist.dropna(subset=["coef"]).groupby("term"):
+        actual = _actual_coef_for_placebo(actual_panel, term)
+        coefs = pd.to_numeric(d["coef"], errors="coerce").dropna()
+        if coefs.empty or pd.isna(actual):
+            continue
+        p_right = float(((coefs >= actual).sum() + 1) / (len(coefs) + 1))
+        p_two = float(((np.abs(coefs) >= abs(actual)).sum() + 1) / (len(coefs) + 1))
+        percentile = float((coefs < actual).mean())
+        rows.append({
+            "metric": labels.get(term, term),
+            "term": term,
+            "actual_coef": actual,
+            "placebo_mean": float(coefs.mean()),
+            "placebo_std": float(coefs.std(ddof=0)),
+            "placebo_q05": float(coefs.quantile(0.05)),
+            "placebo_q50": float(coefs.quantile(0.50)),
+            "placebo_q95": float(coefs.quantile(0.95)),
+            "actual_percentile": percentile,
+            "empirical_p_right_tail": p_right,
+            "empirical_p_two_sided": p_two,
+            "n_sims_valid": int(len(coefs)),
+            "median_n_obs": float(d["n_obs"].median()) if "n_obs" in d.columns else np.nan,
+        })
+    return pd.DataFrame(rows)
+
+
+def _build_actual_placebo_panel(true_events: pd.DataFrame, loaded_assets: List[str], price_panel: pd.DataFrame, cm_panel: pd.DataFrame, artemis_panel: pd.DataFrame, defillama_panel: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    """Build the actual seven-event panel used to benchmark placebo coefficients."""
+    actual_exposure = summarize_pre_event_objective_metrics(true_events, loaded_assets, price_panel, cm_panel, artemis_panel, cfg)
+    actual_exposure = augment_exposure_with_defillama_stable_metrics(actual_exposure, price_panel, defillama_panel, cfg)
+    actual_exposure = add_rank_based_exposures(actual_exposure)
+    return build_event_asset_panel(true_events, loaded_assets, price_panel, actual_exposure, cfg)
+
+
+def _fit_placebo_distribution_from_panel(panel_pl: pd.DataFrame, xvars: List[str]) -> pd.DataFrame:
+    """Fit placebo regressions from a pseudo-event asset panel."""
+    rows = []
+    if panel_pl is not None and not panel_pl.empty and "placebo_sim" in panel_pl.columns:
+        for sim, dd in panel_pl.groupby("placebo_sim"):
+            for x in xvars:
+                r = _fit_placebo_core(dd, x, int(sim))
+                if r is not None:
+                    rows.append(r)
+    return pd.DataFrame(rows)
+
+
+def run_placebo_timing_tests(true_events: pd.DataFrame, loaded_assets: List[str], price_panel: pd.DataFrame, cm_panel: pd.DataFrame, artemis_panel: pd.DataFrame, defillama_panel: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Run same-window placebo timing tests over randomly selected non-event dates.
+
+    This version is chunked and progress-reporting so the script does not appear
+    to hang after the alternative-window table. The placebo pseudo-events use a
+    90-day exposure window, a 60-day expected-return estimation window, and a
+    six-day estimation gap, matching the baseline seven-event design.
+    """
+    pcfg = _placebo_config(cfg)
+    n_sims = int(getattr(cfg, "placebo_draws", 100))
+    chunk_size = max(1, int(getattr(cfg, "placebo_chunk_size", 10)))
+    progress_every = max(1, int(getattr(cfg, "placebo_progress_every", 10)))
+    xvars = [
+        "log_cg_exchange_turnover_mcap_90d_z",
+        "objective_settlement_capacity_z",
+        "objective_tradable_settlement_z",
+        "objective_turnover_x_settlement_z",
+    ]
+
+    print(f"[placebo] starting same-window timing placebo: requested_draws={n_sims}, chunk_size={chunk_size}", flush=True)
+    placebo_events, diag = build_random_placebo_event_sets(true_events, price_panel, cfg, n_sims=n_sims)
+    if placebo_events.empty:
+        print("[placebo] no pseudo-event dates could be generated; see diagnostics below.", flush=True)
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), diag
+
+    actual_panel = _build_actual_placebo_panel(true_events, loaded_assets, price_panel, cm_panel, artemis_panel, defillama_panel, cfg)
+
+    all_dist = []
+    all_panel_brief = []
+    sims = sorted(pd.to_numeric(placebo_events["placebo_sim"], errors="coerce").dropna().astype(int).unique())
+    total = len(sims)
+    t0 = time.time()
+
+    for i in range(0, total, chunk_size):
+        chunk_sims = sims[i:i + chunk_size]
+        pe_chunk = placebo_events[placebo_events["placebo_sim"].isin(chunk_sims)].copy()
+        try:
+            exposure_pl = summarize_pre_event_objective_metrics(pe_chunk, loaded_assets, price_panel, cm_panel, artemis_panel, pcfg)
+            exposure_pl = augment_exposure_with_defillama_stable_metrics(exposure_pl, price_panel, defillama_panel, pcfg)
+            exposure_pl = add_rank_based_exposures(exposure_pl)
+            panel_pl = build_event_asset_panel(pe_chunk, loaded_assets, price_panel, exposure_pl, pcfg)
+            if panel_pl is not None and not panel_pl.empty and "placebo_sim" not in panel_pl.columns:
+                panel_pl = panel_pl.merge(pe_chunk[["event_id", "placebo_sim"]].drop_duplicates(), on="event_id", how="left")
+            if panel_pl is not None and not panel_pl.empty:
+                # Store a lightweight panel summary only for diagnostics.
+                cols = [c for c in [
+                    "placebo_sim", "event_id", "symbol", "car_event_window",
+                    "log_cg_exchange_turnover_mcap_90d_z",
+                    "objective_settlement_capacity_z",
+                    "objective_tradable_settlement_z",
+                    "objective_turnover_x_settlement_z",
+                ] if c in panel_pl.columns]
+                all_panel_brief.append(panel_pl[cols].copy())
+                dist_chunk = _fit_placebo_distribution_from_panel(panel_pl, xvars)
+                if not dist_chunk.empty:
+                    all_dist.append(dist_chunk)
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            if getattr(cfg, "verbose_download_logs", False):
+                print(f"[placebo] chunk {i//chunk_size + 1} failed: {e}", flush=True)
+
+        done = min(i + chunk_size, total)
+        if done == total or done % progress_every == 0:
+            elapsed = time.time() - t0
+            valid_so_far = pd.concat(all_dist, ignore_index=True) if all_dist else pd.DataFrame()
+            n_valid = int(valid_so_far["placebo_sim"].nunique()) if not valid_so_far.empty else 0
+            print(f"[placebo] processed {done}/{total} draws; valid_sims_so_far={n_valid}; elapsed={elapsed:.1f}s", flush=True)
+
+    dist = pd.concat(all_dist, ignore_index=True) if all_dist else pd.DataFrame()
+    panel_brief = pd.concat(all_panel_brief, ignore_index=True) if all_panel_brief else pd.DataFrame()
+    summary = summarize_placebo_empirical(dist, actual_panel)
+
+    diag_rows = [
+        {"item": "placebo_panel_rows", "value": int(len(panel_brief)) if panel_brief is not None and not panel_brief.empty else 0, "note": "pseudo-event asset-event observations processed across chunks"},
+        {"item": "placebo_draws_processed", "value": int(total), "note": "pseudo-event draw sets generated and attempted"},
+        {"item": "placebo_chunk_size", "value": int(chunk_size), "note": "number of placebo simulations processed per chunk"},
+    ]
+    for term, label in [
+        ("log_cg_exchange_turnover_mcap_90d_z", "valid_turnover_placebo_sims"),
+        ("objective_settlement_capacity_z", "valid_settlement_placebo_sims"),
+        ("objective_tradable_settlement_z", "valid_hybrid_placebo_sims"),
+        ("objective_turnover_x_settlement_z", "valid_interaction_placebo_sims"),
+    ]:
+        n_valid = int(dist[dist["term"] == term]["placebo_sim"].nunique()) if not dist.empty else 0
+        diag_rows.append({"item": label, "value": n_valid, "note": "simulations with valid regression for this term"})
+    diag = pd.concat([diag, pd.DataFrame(diag_rows)], ignore_index=True)
+    print(f"[placebo] completed; valid regression rows={len(dist)}", flush=True)
+    return placebo_events, panel_brief, summary, dist, diag
+
+
+def _extract_yfinance_close_column(df: pd.DataFrame, ticker: str) -> pd.Series:
+    """Return an adjusted-close/close series from a yfinance DataFrame."""
+    if df is None or df.empty:
+        return pd.Series(dtype=float)
+    if isinstance(df.columns, pd.MultiIndex):
+        for px in ["Adj Close", "Close"]:
+            if px in df.columns.get_level_values(0):
+                sub = df[px]
+                if isinstance(sub, pd.DataFrame):
+                    if ticker in sub.columns:
+                        return pd.to_numeric(sub[ticker], errors="coerce")
+                    for c in sub.columns:
+                        ser = pd.to_numeric(sub[c], errors="coerce")
+                        if ser.notna().sum() > 0:
+                            return ser
+                else:
+                    return pd.to_numeric(sub, errors="coerce")
+    else:
+        for px in ["Adj Close", "Close"]:
+            if px in df.columns:
+                return pd.to_numeric(df[px], errors="coerce")
+    return pd.Series(dtype=float)
+
+
+def fetch_yfinance_close_series(ticker: str, start_dt: datetime, end_dt: datetime, cfg: Config) -> Tuple[pd.DataFrame, dict]:
+    """Download one macro/security price series from Yahoo Finance via yfinance."""
+    payload = {"ticker": ticker, "start": str(utc(start_dt).date()), "end": str(utc(end_dt).date())}
+    cpath = cache_path("yfinance_macro_close", payload)
+    cached = load_cache(cpath)
+    diag = {"ticker": ticker, "source": "yfinance", "status": "unknown", "price_obs": 0, "return_obs": 0, "message": ""}
+    if cached is not None:
+        out = pd.DataFrame(cached)
+        if not out.empty:
+            out["date"] = pd.to_datetime(out["date"], utc=True, errors="coerce")
+            out["close"] = pd.to_numeric(out["close"], errors="coerce")
+        diag.update({"status": "cache", "price_obs": int(out["close"].notna().sum()) if "close" in out else 0})
+        return out, diag
+    try:
+        yf = ensure_package("yfinance", "yfinance")
+    except Exception as e:
+        diag.update({"status": "missing_yfinance", "message": str(e)[:300]})
+        return pd.DataFrame(columns=["date", "close"]), diag
+    try:
+        start_s = str(utc(start_dt).date())
+        end_s = str((utc(end_dt).floor("D") + pd.Timedelta(days=1)).date())
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            raw = yf.download(ticker, start=start_s, end=end_s, progress=False, auto_adjust=False, actions=False, threads=False)
+        if raw is None or raw.empty:
+            diag.update({"status": "empty_download", "message": "yfinance returned an empty frame"})
+            return pd.DataFrame(columns=["date", "close"]), diag
+        close = _extract_yfinance_close_column(raw, ticker)
+        if close is None or close.empty:
+            diag.update({"status": "no_close_column", "message": f"columns={list(raw.columns)[:10]}"})
+            return pd.DataFrame(columns=["date", "close"]), diag
+        out = pd.DataFrame({
+            "date": pd.to_datetime(close.index, utc=True, errors="coerce").floor("D"),
+            "close": pd.to_numeric(close.values, errors="coerce"),
+        }).dropna(subset=["date"]).drop_duplicates("date").sort_values("date").reset_index(drop=True)
+        out = out.dropna(subset=["close"])
+        diag.update({"status": "downloaded", "price_obs": int(out["close"].notna().sum())})
+        save_cache(cpath, out.assign(date=out["date"].astype(str)).to_dict(orient="records"))
+        return out, diag
+    except Exception as e:
+        diag.update({"status": "download_error", "message": str(e)[:500]})
+        return pd.DataFrame(columns=["date", "close"]), diag
+
+
+def fetch_fred_close_series(series_id: str, start_dt: datetime, end_dt: datetime, cfg: Config) -> Tuple[pd.DataFrame, dict]:
+    """Download a daily macro series from FRED's public CSV endpoint without an API key.
+
+    FRED's graph CSV normally uses columns like ``observation_date,SERIES_ID`` rather
+    than ``DATE,SERIES_ID``. This parser accepts both formats and falls back to the
+    first numeric value column.
+    """
+    payload = {"series_id": series_id, "start": str(utc(start_dt).date()), "end": str(utc(end_dt).date()), "parser": "v2"}
+    cpath = cache_path("fred_macro_close_v2", payload)
+    cached = load_cache(cpath)
+    diag = {"ticker": series_id, "source": "fred_public_csv", "status": "unknown", "price_obs": 0, "return_obs": 0, "message": ""}
+    if cached is not None:
+        out = pd.DataFrame(cached)
+        if not out.empty:
+            out["date"] = pd.to_datetime(out["date"], utc=True, errors="coerce")
+            out["close"] = pd.to_numeric(out["close"], errors="coerce")
+        diag.update({"status": "cache", "price_obs": int(out["close"].notna().sum()) if "close" in out else 0})
+        return out, diag
+    try:
+        url = "https://fred.stlouisfed.org/graph/fredgraph.csv"
+        params = {"id": series_id}
+        headers = {"User-Agent": "Mozilla/5.0 (research script)", "Accept": "text/csv,*/*"}
+        r = SESSION.get(url, params=params, headers=headers, timeout=cfg.timeout_sec)
+        txt = r.text or ""
+        if r.status_code != 200 or not txt.strip():
+            diag.update({"status": f"http_{r.status_code}", "message": txt[:160]})
+            return pd.DataFrame(columns=["date", "close"]), diag
+        df = pd.read_csv(io.StringIO(txt))
+        if df.empty:
+            diag.update({"status": "empty_download", "message": "FRED returned empty CSV"})
+            return pd.DataFrame(columns=["date", "close"]), diag
+
+        lower = {str(c).strip().lower(): c for c in df.columns}
+        date_col = lower.get("date") or lower.get("observation_date") or lower.get("time")
+        value_col = None
+        for c in df.columns:
+            if str(c).strip().upper() == str(series_id).upper():
+                value_col = c
+                break
+        if value_col is None:
+            for c in df.columns:
+                if c == date_col:
+                    continue
+                tmp = pd.to_numeric(df[c].replace(".", np.nan), errors="coerce")
+                if tmp.notna().sum() > 0:
+                    value_col = c
+                    break
+        if date_col is None or value_col is None:
+            diag.update({"status": "bad_fred_csv", "message": f"columns={list(df.columns)[:10]}"})
+            return pd.DataFrame(columns=["date", "close"]), diag
+
+        out = pd.DataFrame({
+            "date": pd.to_datetime(df[date_col], utc=True, errors="coerce").dt.floor("D"),
+            "close": pd.to_numeric(df[value_col].replace(".", np.nan), errors="coerce"),
+        }).dropna(subset=["date", "close"]).drop_duplicates("date").sort_values("date").reset_index(drop=True)
+        out = out[(out["date"] >= utc(start_dt).floor("D")) & (out["date"] <= utc(end_dt).floor("D"))].copy()
+        if out.empty:
+            diag.update({"status": "empty_download", "message": "FRED returned no usable numeric observations in requested window"})
+            return pd.DataFrame(columns=["date", "close"]), diag
+        diag.update({"status": "downloaded", "price_obs": int(out["close"].notna().sum()), "message": f"value_col={value_col}"})
+        save_cache(cpath, out.assign(date=out["date"].astype(str)).to_dict(orient="records"))
+        return out, diag
+    except Exception as e:
+        diag.update({"status": "download_error", "message": str(e)[:500]})
+        return pd.DataFrame(columns=["date", "close"]), diag
+
+
+def fetch_stooq_close_series(ticker: str, start_dt: datetime, end_dt: datetime, cfg: Config) -> Tuple[pd.DataFrame, dict]:
+    """Download one daily series from Stooq's public CSV endpoint."""
+    payload = {"ticker": ticker, "start": str(utc(start_dt).date()), "end": str(utc(end_dt).date())}
+    cpath = cache_path("stooq_macro_close", payload)
+    cached = load_cache(cpath)
+    diag = {"ticker": ticker, "source": "stooq", "status": "unknown", "price_obs": 0, "return_obs": 0, "message": ""}
+    if cached is not None:
+        out = pd.DataFrame(cached)
+        if not out.empty:
+            out["date"] = pd.to_datetime(out["date"], utc=True, errors="coerce")
+            out["close"] = pd.to_numeric(out["close"], errors="coerce")
+        diag.update({"status": "cache", "price_obs": int(out["close"].notna().sum()) if "close" in out else 0})
+        return out, diag
+    try:
+        d1 = utc(start_dt).strftime("%Y%m%d")
+        d2 = utc(end_dt).strftime("%Y%m%d")
+        url = "https://stooq.com/q/d/l/"
+        params = {"s": ticker.lower(), "d1": d1, "d2": d2, "i": "d"}
+        r = SESSION.get(url, params=params, timeout=cfg.timeout_sec)
+        txt = r.text or ""
+        if r.status_code != 200 or not txt.strip() or "No data" in txt[:200]:
+            diag.update({"status": f"http_{r.status_code}", "message": txt[:120]})
+            return pd.DataFrame(columns=["date", "close"]), diag
+        df = pd.read_csv(io.StringIO(txt))
+        cols = {str(c).lower(): c for c in df.columns}
+        if "date" not in cols or "close" not in cols:
+            diag.update({"status": "bad_stooq_csv", "message": f"columns={list(df.columns)[:10]}"})
+            return pd.DataFrame(columns=["date", "close"]), diag
+        out = pd.DataFrame({
+            "date": pd.to_datetime(df[cols["date"]], utc=True, errors="coerce").dt.floor("D"),
+            "close": pd.to_numeric(df[cols["close"]], errors="coerce"),
+        }).dropna(subset=["date", "close"]).drop_duplicates("date").sort_values("date").reset_index(drop=True)
+        if out.empty:
+            diag.update({"status": "empty_download", "message": "Stooq returned no usable numeric observations"})
+            return pd.DataFrame(columns=["date", "close"]), diag
+        diag.update({"status": "downloaded", "price_obs": int(out["close"].notna().sum())})
+        save_cache(cpath, out.assign(date=out["date"].astype(str)).to_dict(orient="records"))
+        return out, diag
+    except Exception as e:
+        diag.update({"status": "download_error", "message": str(e)[:500]})
+        return pd.DataFrame(columns=["date", "close"]), diag
+
+
+
+def fetch_datahub_brent_series(start_dt: datetime, end_dt: datetime, cfg: Config) -> Tuple[pd.DataFrame, dict]:
+    """Download Brent daily spot price from DataHub oil-prices CSV.
+
+    DataHub mirrors the public EIA Brent spot series in a simple CSV with columns
+    Date and Price. This is a practical fallback when FRED/Yahoo are blocked.
+    """
+    payload = {"source": "datahub_brent_daily", "start": str(utc(start_dt).date()), "end": str(utc(end_dt).date())}
+    cpath = cache_path("datahub_brent_daily", payload)
+    cached = load_cache(cpath)
+    diag = {"ticker": "brent-daily.csv", "source": "datahub_eia_oil_prices", "status": "unknown", "price_obs": 0, "return_obs": 0, "message": ""}
+    if cached is not None:
+        out = pd.DataFrame(cached)
+        if not out.empty:
+            out["date"] = pd.to_datetime(out["date"], utc=True, errors="coerce")
+            out["close"] = pd.to_numeric(out["close"], errors="coerce")
+        diag.update({"status": "cache", "price_obs": int(out["close"].notna().sum()) if "close" in out else 0})
+        return out, diag
+    try:
+        url = "https://datahub.io/core/oil-prices/_r/-/data/brent-daily.csv"
+        r = SESSION.get(url, timeout=cfg.timeout_sec, headers={"User-Agent": "Mozilla/5.0", "Accept": "text/csv,*/*"})
+        txt = r.text or ""
+        if r.status_code != 200 or not txt.strip():
+            diag.update({"status": f"http_{r.status_code}", "message": txt[:160]})
+            return pd.DataFrame(columns=["date", "close"]), diag
+        df = pd.read_csv(io.StringIO(txt))
+        lower = {str(c).strip().lower(): c for c in df.columns}
+        date_col = lower.get("date")
+        price_col = lower.get("price") or lower.get("close") or lower.get("value")
+        if date_col is None or price_col is None:
+            diag.update({"status": "bad_csv", "message": f"columns={list(df.columns)[:10]}"})
+            return pd.DataFrame(columns=["date", "close"]), diag
+        out = pd.DataFrame({
+            "date": pd.to_datetime(df[date_col], utc=True, errors="coerce").dt.floor("D"),
+            "close": pd.to_numeric(df[price_col], errors="coerce"),
+        }).dropna(subset=["date", "close"]).drop_duplicates("date").sort_values("date")
+        out = out[(out["date"] >= utc(start_dt).floor("D")) & (out["date"] <= utc(end_dt).floor("D"))].reset_index(drop=True)
+        if out.empty:
+            diag.update({"status": "empty_download", "message": "DataHub Brent returned no observations in requested window"})
+            return pd.DataFrame(columns=["date", "close"]), diag
+        diag.update({"status": "downloaded", "price_obs": int(out["close"].notna().sum())})
+        save_cache(cpath, out.assign(date=out["date"].astype(str)).to_dict(orient="records"))
+        return out, diag
+    except Exception as e:
+        diag.update({"status": "download_error", "message": str(e)[:500]})
+        return pd.DataFrame(columns=["date", "close"]), diag
+
+
+def fetch_cboe_vix_series(start_dt: datetime, end_dt: datetime, cfg: Config) -> Tuple[pd.DataFrame, dict]:
+    """Download official Cboe VIX history CSV."""
+    payload = {"source": "cboe_vix_history", "start": str(utc(start_dt).date()), "end": str(utc(end_dt).date())}
+    cpath = cache_path("cboe_vix_history", payload)
+    cached = load_cache(cpath)
+    diag = {"ticker": "VIX_History.csv", "source": "cboe_direct_csv", "status": "unknown", "price_obs": 0, "return_obs": 0, "message": ""}
+    if cached is not None:
+        out = pd.DataFrame(cached)
+        if not out.empty:
+            out["date"] = pd.to_datetime(out["date"], utc=True, errors="coerce")
+            out["close"] = pd.to_numeric(out["close"], errors="coerce")
+        diag.update({"status": "cache", "price_obs": int(out["close"].notna().sum()) if "close" in out else 0})
+        return out, diag
+    try:
+        url = "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv"
+        r = SESSION.get(url, timeout=cfg.timeout_sec, headers={"User-Agent": "Mozilla/5.0", "Accept": "text/csv,*/*"})
+        txt = r.text or ""
+        if r.status_code != 200 or not txt.strip():
+            diag.update({"status": f"http_{r.status_code}", "message": txt[:160]})
+            return pd.DataFrame(columns=["date", "close"]), diag
+        df = pd.read_csv(io.StringIO(txt))
+        lower = {str(c).strip().lower(): c for c in df.columns}
+        date_col = lower.get("date")
+        close_col = lower.get("close") or lower.get("vix close") or lower.get("vix_close")
+        if date_col is None or close_col is None:
+            diag.update({"status": "bad_csv", "message": f"columns={list(df.columns)[:10]}"})
+            return pd.DataFrame(columns=["date", "close"]), diag
+        out = pd.DataFrame({
+            "date": pd.to_datetime(df[date_col], utc=True, errors="coerce").dt.floor("D"),
+            "close": pd.to_numeric(df[close_col], errors="coerce"),
+        }).dropna(subset=["date", "close"]).drop_duplicates("date").sort_values("date")
+        out = out[(out["date"] >= utc(start_dt).floor("D")) & (out["date"] <= utc(end_dt).floor("D"))].reset_index(drop=True)
+        if out.empty:
+            diag.update({"status": "empty_download", "message": "Cboe VIX returned no observations in requested window"})
+            return pd.DataFrame(columns=["date", "close"]), diag
+        diag.update({"status": "downloaded", "price_obs": int(out["close"].notna().sum())})
+        save_cache(cpath, out.assign(date=out["date"].astype(str)).to_dict(orient="records"))
+        return out, diag
+    except Exception as e:
+        diag.update({"status": "download_error", "message": str(e)[:500]})
+        return pd.DataFrame(columns=["date", "close"]), diag
+
+
+def build_btc_return_from_price_panel(price_panel: Optional[pd.DataFrame]) -> Tuple[pd.DataFrame, dict]:
+    """Build BTC return directly from the already downloaded CoinGecko BTCUSDT series."""
+    diag = {"ticker": "BTCUSDT/CoinGecko", "source": "coingecko_asset_panel", "status": "unavailable", "price_obs": 0, "return_obs": 0, "message": "BTCUSDT not found in price panel"}
+    if price_panel is None or price_panel.empty:
+        return pd.DataFrame(columns=["date", "btc_ret"]), diag
+    d = price_panel[price_panel["symbol"].astype(str) == "BTCUSDT"].copy()
+    if d.empty:
+        return pd.DataFrame(columns=["date", "btc_ret"]), diag
+    d["date"] = pd.to_datetime(d["date"], utc=True, errors="coerce").dt.floor("D")
+    d["price"] = pd.to_numeric(d["price"], errors="coerce")
+    d = d.dropna(subset=["date", "price"]).drop_duplicates("date").sort_values("date")
+    d["btc_ret"] = np.log(d["price"].replace(0, np.nan)).diff()
+    out = d[["date", "btc_ret"]].copy()
+    diag.update({"status": "built_from_price_panel", "price_obs": int(d["price"].notna().sum()), "return_obs": int(out["btc_ret"].notna().sum()), "message": "BTC return built from CoinGecko BTCUSDT price panel"})
+    return out, diag
+
+
+def load_local_macro_controls_if_requested(cfg: Config) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Optional manual fallback. Disabled by default because the preferred path is auto-download."""
+    if not getattr(cfg, "use_local_macro_csv_fallback", False):
+        return pd.DataFrame(), pd.DataFrame([{"source": "local_csv", "status": "disabled", "message": "local CSV fallback disabled"}])
+    path = resolve_existing_file(cfg.macro_controls_candidates, "optional macro controls")
+    if path is None:
+        return pd.DataFrame(), pd.DataFrame([{"source": "local_csv", "status": "not_found", "message": "no local macro_controls.csv found"}])
+    df = pd.read_csv(path)
+    date_col = next((c for c in df.columns if str(c).lower() in ["date", "datetime", "time"]), None)
+    if date_col is None:
+        return pd.DataFrame(), pd.DataFrame([{"source": "local_csv", "status": "no_date_column", "message": path}])
+    df = df.copy()
+    df["date"] = pd.to_datetime(df[date_col], utc=True, errors="coerce").dt.floor("D")
+    keep = ["date"] + [c for c in ["brent_ret", "vix_ret", "dxy_ret", "sp500_ret", "btc_ret", "crypto_mkt_ret"] if c in df.columns]
+    out = df[keep].dropna(subset=["date"]).copy()
+    for c in keep:
+        if c != "date":
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+    diag = pd.DataFrame([{"source": "local_csv", "status": "loaded", "message": path, "rows": int(len(out))}])
+    return out, diag
+
+
+def _append_macro_return(frames: List[pd.DataFrame], diagnostics: List[dict], name: str, px: pd.DataFrame, diag: dict):
+    diag = dict(diag)
+    diag["variable"] = f"{name}_ret"
+    if px is None or px.empty or "close" not in px.columns or px["close"].notna().sum() < 3:
+        diag["return_obs"] = 0
+        diagnostics.append(diag)
+        return
+    z = px.sort_values("date").copy()
+    z[f"{name}_ret"] = np.log(pd.to_numeric(z["close"], errors="coerce").replace(0, np.nan)).diff()
+    ret = z[["date", f"{name}_ret"]].dropna(subset=["date"]).copy()
+    diag["return_obs"] = int(ret[f"{name}_ret"].notna().sum())
+    diagnostics.append(diag)
+    frames.append(ret)
+
+
+
+def download_macro_controls(cfg: Config, start_dt: datetime, end_dt: datetime, price_panel: Optional[pd.DataFrame] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Download Brent, VIX, DXY, S&P 500, BTC and crypto-market controls.
+
+    Reliable-source order:
+    - BTC: CoinGecko BTCUSDT already in the price panel; fallback Yahoo.
+    - Brent: FRED DCOILBRENTEU -> DataHub/EIA Brent CSV -> Stooq/Yahoo.
+    - VIX: Cboe official CSV -> FRED VIXCLS -> Stooq/Yahoo.
+    - DXY: FRED DTWEXBGS broad dollar index proxy -> Stooq/Yahoo DXY/future tickers.
+    - S&P 500: FRED SP500 -> Stooq ^SPX -> Yahoo ^GSPC/SPY.
+
+    All series are converted to log returns and then aggregated over each event window.
+    """
+    diagnostics = []
+    if not getattr(cfg, "macro_download_enabled", True):
+        local, local_diag = load_local_macro_controls_if_requested(cfg)
+        return local, local_diag
+    frames = []
+
+    btc_df, btc_diag = build_btc_return_from_price_panel(price_panel)
+    btc_diag = dict(btc_diag); btc_diag["variable"] = "btc_ret"
+    if btc_df is not None and not btc_df.empty and btc_df["btc_ret"].notna().sum() >= 3:
+        diagnostics.append(btc_diag)
+        frames.append(btc_df)
+    else:
+        diagnostics.append(btc_diag)
+        for ticker in getattr(cfg, "macro_yfinance_fallback_tickers", {}).get("btc", ["BTC-USD"]):
+            px, diag = fetch_yfinance_close_series(ticker, start_dt, end_dt, cfg)
+            diag = dict(diag); diag["variable"] = "btc_ret"; diag["source_priority"] = "btc_yfinance_fallback"
+            if px is not None and not px.empty and px["close"].notna().sum() >= 3:
+                _append_macro_return(frames, diagnostics, "btc", px, diag)
+                break
+            diag["return_obs"] = 0; diagnostics.append(diag)
+
+    def candidates_for(name: str):
+        cand = []
+        if name == "brent":
+            fred_id = getattr(cfg, "macro_fred_series", {}).get("brent")
+            if fred_id:
+                cand.append(("1_fred_brent_spot", lambda: fetch_fred_close_series(fred_id, start_dt, end_dt, cfg)))
+            cand.append(("2_datahub_eia_brent", lambda: fetch_datahub_brent_series(start_dt, end_dt, cfg)))
+        elif name == "vix":
+            cand.append(("1_cboe_official_vix", lambda: fetch_cboe_vix_series(start_dt, end_dt, cfg)))
+            fred_id = getattr(cfg, "macro_fred_series", {}).get("vix")
+            if fred_id:
+                cand.append(("2_fred_vix", lambda: fetch_fred_close_series(fred_id, start_dt, end_dt, cfg)))
+        elif name == "dxy":
+            fred_id = getattr(cfg, "macro_fred_series", {}).get("dxy")
+            if fred_id:
+                cand.append(("1_fred_broad_dollar_proxy", lambda: fetch_fred_close_series(fred_id, start_dt, end_dt, cfg)))
+        elif name == "sp500":
+            fred_id = getattr(cfg, "macro_fred_series", {}).get("sp500")
+            if fred_id:
+                cand.append(("1_fred_sp500", lambda: fetch_fred_close_series(fred_id, start_dt, end_dt, cfg)))
+
+        for ticker in getattr(cfg, "macro_stooq_tickers", {}).get(name, []):
+            cand.append(("3_stooq", lambda ticker=ticker: fetch_stooq_close_series(ticker, start_dt, end_dt, cfg)))
+
+        primary_ticker = getattr(cfg, "macro_yfinance_tickers", {}).get(name, "")
+        y_candidates = list(dict.fromkeys([primary_ticker] + list(getattr(cfg, "macro_yfinance_fallback_tickers", {}).get(name, []))))
+        for ticker in [x for x in y_candidates if x]:
+            cand.append(("4_yfinance", lambda ticker=ticker: fetch_yfinance_close_series(ticker, start_dt, end_dt, cfg)))
+        return cand
+
+    for name in ["brent", "vix", "dxy", "sp500"]:
+        loaded = False
+        attempts = []
+        for priority, getter in candidates_for(name):
+            try:
+                px, diag = getter()
+            except Exception as e:
+                px = pd.DataFrame(columns=["date", "close"])
+                diag = {"source": priority, "ticker": "unknown", "status": "exception", "price_obs": 0, "return_obs": 0, "message": str(e)[:500]}
+            diag = dict(diag)
+            diag["variable"] = f"{name}_ret"
+            diag["source_priority"] = priority
+            if name == "dxy" and "fred" in str(diag.get("source", "")):
+                diag["message"] = (diag.get("message", "") + " Uses FRED DTWEXBGS as a broad dollar-index proxy, not ICE DXY.").strip()
+            if px is not None and not px.empty and "close" in px.columns and px["close"].notna().sum() >= 3:
+                diagnostics.extend(attempts)
+                _append_macro_return(frames, diagnostics, name, px, diag)
+                loaded = True
+                break
+            diag["return_obs"] = 0
+            attempts.append(diag)
+        if not loaded:
+            diagnostics.extend(attempts)
+            diagnostics.append({
+                "source": "all_sources",
+                "variable": f"{name}_ret",
+                "ticker": "FRED/Cboe/DataHub/Stooq/Yahoo",
+                "status": "all_sources_failed",
+                "price_obs": 0,
+                "return_obs": 0,
+                "message": "No usable series from configured public sources.",
+            })
+
+    if frames:
+        out = frames[0]
+        for f in frames[1:]:
+            out = out.merge(f, on="date", how="outer")
+        out = out.sort_values("date").reset_index(drop=True)
+    else:
+        out = pd.DataFrame(columns=["date"])
+
+    if price_panel is not None and not price_panel.empty and "ret" in price_panel.columns:
+        mkt = price_panel.copy()
+        mkt["date"] = pd.to_datetime(mkt["date"], utc=True, errors="coerce").dt.floor("D")
+        mkt["ret"] = pd.to_numeric(mkt["ret"], errors="coerce")
+        crypto = mkt.groupby("date", as_index=False)["ret"].mean().rename(columns={"ret": "crypto_mkt_ret"})
+        if out.empty or list(out.columns) == ["date"]:
+            out = crypto
+        else:
+            out = out.merge(crypto, on="date", how="outer")
+        diagnostics.append({"source": "coingecko_asset_panel", "variable": "crypto_mkt_ret", "ticker": "equal_weight_30_assets", "status": "built_from_price_panel", "price_obs": np.nan, "return_obs": int(crypto["crypto_mkt_ret"].notna().sum()), "message": "equal-weight mean of available asset log returns"})
+
+    out = out.sort_values("date").reset_index(drop=True) if not out.empty else out
+    if (out.empty or len([c for c in out.columns if c != "date"]) == 0) and getattr(cfg, "use_local_macro_csv_fallback", False):
+        local, local_diag = load_local_macro_controls_if_requested(cfg)
+        diagnostics.extend(local_diag.to_dict(orient="records") if isinstance(local_diag, pd.DataFrame) else [])
+        return local, pd.DataFrame(diagnostics)
+    return out, pd.DataFrame(diagnostics)
+
+
+def build_event_macro_controls(events: pd.DataFrame, macro_panel: pd.DataFrame) -> pd.DataFrame:
+    if events is None or events.empty or macro_panel is None or macro_panel.empty:
+        return pd.DataFrame()
+    macro_cols = [c for c in macro_panel.columns if c != "date"]
+    rows = []
+    for _, ev in events.iterrows():
+        t = utc(ev["event_date"]).floor("D")
+        k = int(ev.get("car_post_days", 5))
+        sl = macro_panel[(macro_panel["date"] >= t) & (macro_panel["date"] <= t + pd.Timedelta(days=k))].copy()
+        row = {"event_id": ev["event_id"], "event_date": t, "macro_window_days": k, "macro_obs_days": int(len(sl))}
+        for c in macro_cols:
+            row[f"{c}_event_sum"] = sl[c].sum(min_count=1) if not sl.empty else np.nan
+            row[f"{c}_event_mean"] = sl[c].mean() if not sl.empty else np.nan
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    for c in [x for x in out.columns if x.endswith("_event_sum")]:
+        out[c + "_z"] = zscore(out[c])
+    return out
+
+
+def run_macro_interaction_specs(panel: pd.DataFrame, macro_events: pd.DataFrame, label: str) -> pd.DataFrame:
+    if panel is None or panel.empty or macro_events is None or macro_events.empty:
+        return pd.DataFrame()
+    d = panel.merge(macro_events.drop(columns=["event_date"], errors="ignore"), on="event_id", how="left")
+    out = []
+    macro_z_cols = [c for c in d.columns if c.endswith("_event_sum_z")]
+    for m in macro_z_cols:
+        dd = d.dropna(subset=["car_event_window", "objective_primary_z", m]).copy()
+        if len(dd) < 30 or dd["event_id"].nunique() < 3:
+            continue
+        term = f"objective_primary_z:{m}"
+        formula = f"car_event_window ~ objective_primary_z + objective_primary_z:{m} + C(event_id)"
+        model = fit_model(formula, dd, cov_type="HC1")
+        res = extract_terms(model, dd, f"{label}_MACRO_INTERACTION_{m}", "car_event_window", ["objective_primary_z", term])
+        res.insert(0, "sample", label)
+        out.append(res)
+    return pd.concat(out, ignore_index=True) if out else pd.DataFrame()
+
+def build_event_count_diagnostic(episodes: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
+    rows = [
+        {"design": "main_episode_level", "n_shocks": episodes["event_id"].nunique(), "inference_strength": "weak-to-moderate", "recommendation": "Two episodes are useful for reducing overlapping windows, but formal inference is limited; add comparable shipping/geopolitical settlement episodes if available."},
+        {"design": "seven_event_robustness", "n_shocks": events["event_id"].nunique(), "inference_strength": "moderate robustness check", "recommendation": "Use as robustness, but April events are clustered and should not be treated as fully independent shocks."},
+    ]
+    return pd.DataFrame(rows)
+
+
+def compact_conclusion_flags(main_results: pd.DataFrame, label: str) -> pd.DataFrame:
+    rows = []
+    for model_name in [f"{label}_MAIN_raw_FE_HC1", f"{label}_MAIN_WLS_liquidity_precision", f"{label}_MAIN_controls_FE_HC1"]:
+        z = main_results[(main_results["model_name"] == model_name)] if not main_results.empty else pd.DataFrame()
+        if z.empty:
+            continue
+        r = z.iloc[0]
+        interp = "not supportive"
+        if pd.notna(r["coef"]) and r["coef"] > 0 and r["p_value"] < 0.05:
+            interp = "positive and statistically significant"
+        elif pd.notna(r["coef"]) and r["coef"] > 0 and r["p_value"] < 0.10:
+            interp = "positive and marginally significant"
+        elif pd.notna(r["coef"]) and r["coef"] > 0:
+            interp = "positive but insignificant"
+        rows.append({"sample": label, "model_name": model_name, "coef": r["coef"], "p_value": r["p_value"], "interpretation": interp})
+    return pd.DataFrame(rows)
+
+
+# =========================================================
+# Compact terminal-output helpers
+# =========================================================
+
+def _round_display(df: pd.DataFrame, digits: int = 4) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    for c in out.columns:
+        if pd.api.types.is_numeric_dtype(out[c]):
+            out[c] = pd.to_numeric(out[c], errors="coerce").round(digits)
+    return out
+
+
+def compact_print_df(title: str, df: pd.DataFrame, columns: Optional[List[str]] = None, max_rows: int = 20, digits: int = 4):
+    print_section(title)
+    if df is None or df.empty:
+        print("[EMPTY]")
+        return
+    out = df.copy()
+    if columns is not None:
+        cols = [c for c in columns if c in out.columns]
+        out = out[cols]
+    out = _round_display(out, digits=digits)
+    if len(out) > max_rows:
+        print(out.head(max_rows).to_string(index=False))
+        print(f"... ({len(out)} rows total; showing first {max_rows}; CSV export is disabled)")
+    else:
+        print(out.to_string(index=False))
+
+
+def metric_brief(results: pd.DataFrame) -> pd.DataFrame:
+    if results is None or results.empty:
+        return pd.DataFrame()
+    keep_metrics = [
+        "Exchange turnover intensity",
+        "Exchange turnover, symbol-clustered",
+        "Exchange turnover + controls",
+        "DefiLlama stablecoin supply / mcap",
+        "Stablecoin supply / mcap, clustered",
+        "Stablecoin supply / mcap + controls",
+        "Mapped-sample turnover + stablecoin supply composite",
+        "Turnover x stablecoin supply",
+    ]
+    d = build_key_metric_comparison(results)
+    if d.empty:
+        return d
+    d = d[d["metric"].isin(keep_metrics)].copy()
+    return d[["sample", "metric", "coef", "std_err", "p_value", "n_obs", "n_events", "n_assets", "support"]]
+
+
+def key_robustness_brief(rank_excl: pd.DataFrame) -> pd.DataFrame:
+    if rank_excl is None or rank_excl.empty:
+        return pd.DataFrame()
+    wanted = [
+        "RANK_turnover_pct",
+        "RANK_turnover_top_tercile",
+        "RANK_settlement_capacity_pct",
+        "RANK_hybrid_pct",
+        "NO_L2_turnover",
+        "NO_L2_settlement",
+        "NO_L2_hybrid",
+        "EX_TOP2_TURNOVER_turnover",
+        "EX_TOP2_TURNOVER_hybrid",
+    ]
+    rows = []
+    for w in wanted:
+        hit = rank_excl[rank_excl["model_name"].str.contains(w, regex=False, na=False)]
+        if not hit.empty:
+            rows.append(hit.iloc[0])
+    if not rows:
+        return pd.DataFrame()
+    out = pd.DataFrame(rows)
+    return out[["sample", "model_name", "term", "coef", "std_err", "p_value", "n_obs", "n_events", "n_assets"]]
+
+
+def alt_window_brief(results: pd.DataFrame) -> pd.DataFrame:
+    if results is None or results.empty:
+        return pd.DataFrame()
+    d = build_key_metric_comparison(results)
+    if d.empty:
+        return d
+    keep = ["Exchange turnover intensity", "DefiLlama stablecoin supply / mcap", "Mapped-sample turnover + stablecoin supply composite", "Turnover x stablecoin supply"]
+    return d[d["metric"].isin(keep)][["sample", "metric", "coef", "std_err", "p_value", "n_obs", "n_events", "n_assets", "support"]]
+
+
+def placebo_brief(summary: pd.DataFrame) -> pd.DataFrame:
+    if summary is None or summary.empty:
+        return pd.DataFrame()
+    cols = [
+        "metric", "actual_coef", "placebo_mean", "placebo_std",
+        "placebo_q05", "placebo_q50", "placebo_q95",
+        "actual_percentile", "empirical_p_right_tail", "empirical_p_two_sided",
+        "n_sims_valid",
+    ]
+    return summary[[c for c in cols if c in summary.columns]].copy()
+
+
+def source_coverage_brief(cov: pd.DataFrame, src: pd.DataFrame, loaded_assets: List[str], cm_panel: pd.DataFrame, defillama_panel: pd.DataFrame, artemis_panel: pd.DataFrame) -> pd.DataFrame:
+    rows = [
+        {"item": "CoinGecko asset prices", "coverage": f"{len(loaded_assets)}/{len(ASSET_UNIVERSE)} assets", "note": "price, market cap, volume, returns"},
+        {"item": "Coin Metrics on-chain variables", "coverage": f"{cm_panel['symbol'].nunique() if not cm_panel.empty else 0}/{len(loaded_assets)} assets", "note": "not used if coverage is zero"},
+        {"item": "DefiLlama stablecoin capacity", "coverage": f"{defillama_panel['symbol'].nunique() if not defillama_panel.empty else 0}/{len(loaded_assets)} assets", "note": "chain-mapped settlement-capacity proxy"},
+        {"item": "Artemis P2P stablecoin flow", "coverage": f"{artemis_panel['symbol'].nunique() if not artemis_panel.empty else 0}/{len(loaded_assets)} assets", "note": "requires ARTEMIS_API_KEY"},
+    ]
+    if src is not None and not src.empty:
+        mix = "; ".join([f"{r['objective_source']}={int(r['n_obs'])}" for _, r in src.iterrows()])
+        rows.append({"item": "Primary objective source mix", "coverage": mix, "note": "main exposure source actually used"})
+    return pd.DataFrame(rows)
+
+
+def macro_brief(diag: pd.DataFrame) -> pd.DataFrame:
+    if diag is None or diag.empty:
+        return pd.DataFrame()
+    out = diag.copy()
+    for c in ["variable", "ticker", "source", "status", "price_obs", "return_obs", "message"]:
+        if c not in out.columns:
+            out[c] = np.nan
+    out["success"] = out["status"].astype(str).isin(["downloaded", "cache", "built_from_price_panel"])
+    # Show the successful source if present; otherwise show the explicit all_sources_failed row if available.
+    rows = []
+    for var, d in out.groupby("variable", dropna=False):
+        succ = d[d["success"]].copy()
+        if not succ.empty:
+            rows.append(succ.iloc[-1].to_dict())
+        else:
+            final = d[d["status"].astype(str).eq("all_sources_failed")]
+            rows.append((final.iloc[-1] if not final.empty else d.iloc[-1]).to_dict())
+    res = pd.DataFrame(rows)
+    return res[["variable", "source", "ticker", "status", "price_obs", "return_obs", "message"]].sort_values("variable")
+
+
+def peg_table_brief(peg_table: pd.DataFrame) -> pd.DataFrame:
+    """Compact display table for direct USDC/USD and USDT/USD peg diagnostics.
+
+    The table reports direct USD peg diagnostics and removes the earlier
+    USDC/USDT cross-pair interpretation.
+    """
+    if peg_table is None or peg_table.empty:
+        return pd.DataFrame()
+    out = peg_table.copy()
+    if "event_date" in out.columns:
+        out["event_date"] = pd.to_datetime(out["event_date"], utc=True, errors="coerce").dt.strftime("%Y-%m-%d")
+    keep = [
+        "event_id",
+        "event_date",
+        "max_usdc_peg_dev",
+        "max_usdt_peg_dev",
+        "max_major_stablecoin_peg_dev",
+        "major_stablecoins_stable_le_10bps",
+        "usdc_usd_volume_abnormal_z",
+        "usdt_usd_volume_abnormal_z",
+        "stable_abnormal_volume_pct",
+        "stable_abnormal_volume_z",
+        "peg_price_source",
+        "peg_volume_interpretation",
+    ]
+    return out[[c for c in keep if c in out.columns]].copy()
+
+
+def warning_flags(cov_ep: pd.DataFrame, ep_results: pd.DataFrame, ev7_results: pd.DataFrame, rank_excl_ep: pd.DataFrame, rank_excl_ev7: pd.DataFrame, macro_diag: pd.DataFrame, placebo_pooled: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    def add(flag, status, note):
+        rows.append({"check": flag, "status": status, "paper_interpretation": note})
+    cm_cov = 0
+    if cov_ep is not None and not cov_ep.empty and "variable" in cov_ep:
+        z = cov_ep[cov_ep["variable"].astype(str).str.contains("cm_", na=False)]
+        cm_cov = int(z["non_missing_obs"].sum()) if "non_missing_obs" in z else 0
+    add("Coin Metrics on-chain flow", "not available" if cm_cov == 0 else "available", "Do not claim Coin Metrics on-chain-flow evidence if unavailable.")
+    for label, res in [("main episode WLS", ep_results), ("seven-event WLS", ev7_results)]:
+        if res is not None and not res.empty:
+            z = res[res["model_name"].astype(str).str.contains("WLS_liquidity_precision", na=False)]
+            if not z.empty:
+                pval = float(z.iloc[0]["p_value"])
+                add(label, "insignificant" if pval >= 0.05 else "significant", "If insignificant, frame results as equal-weighted cross-sectional evidence, not liquidity-weighted portfolio evidence.")
+    for label, rtab in [("main no-L2 turnover", rank_excl_ep), ("seven-event no-L2 turnover", rank_excl_ev7)]:
+        if rtab is not None and not rtab.empty:
+            z = rtab[rtab["model_name"].astype(str).str.contains("NO_L2_turnover", na=False)]
+            if not z.empty:
+                pval = float(z.iloc[0]["p_value"])
+                add(label, "weaker" if pval >= 0.05 else "still significant", "If weaker, state that L2 assets are an important part of the pattern; do not hide it.")
+    if macro_diag is not None and not macro_diag.empty:
+        mb = macro_brief(macro_diag)
+        external = mb[~mb["variable"].astype(str).str.contains("crypto_mkt", na=False)] if not mb.empty else pd.DataFrame()
+        ok = int(external["status"].astype(str).isin(["downloaded", "cache"]).sum()) if not external.empty else 0
+        add("external macro controls", "partial/failed" if ok == 0 else f"{ok} external variables loaded", "Only report macro controls that successfully downloaded.")
+    add("placebo timing", "available" if placebo_pooled is not None and not placebo_pooled.empty else "empty", "Only report placebo if this table is non-empty.")
+    return pd.DataFrame(rows)
+
+# =========================================================
+# Main
+# =========================================================
+
+def main():
+    print_section("0) Compact terminal run: daily Hormuz objective episode study")
+    print(f"Study window: {CFG.start_date.date()} -> {CFG.end_date.date()}; effective data end: {CFG.effective_data_end_date.date()}")
+    print(f"Assets: {len(ASSET_UNIVERSE)} non-stable cryptoassets. Main design: 2 episodes. Robustness design: 7 events.")
+    print("Daily-only terminal output is compact. CSV export is disabled. Set CFG.verbose_download_logs=True only for debugging downloads.")
+
+    events7 = build_events(FIXED_HORMUZ_EVENTS, CFG)
+    episodes = build_events(EPISODES, CFG)
+    all_events = pd.concat([events7, episodes], ignore_index=True)
+    data_start = min(events7["event_date"].min(), episodes["event_date"].min()) - pd.Timedelta(days=max(CFG.objective_pre_days + 20, CFG.estimation_pre_days + 20))
+    data_end = CFG.effective_data_end_date
+
+    print_section("1) Data download and coverage")
+    price_panel = build_crypto_price_panel(ASSET_UNIVERSE, CFG, data_start, data_end)
+    loaded_assets = sorted(price_panel["symbol"].dropna().unique().tolist()) if not price_panel.empty else []
+    cm_panel = build_coinmetrics_panel(loaded_assets, data_start, data_end)
+    artemis_panel = build_artemis_panel(loaded_assets, data_start, data_end)
+    defillama_panel = build_defillama_chain_stablecoin_panel(loaded_assets, CFG)
+
+    portwatch7 = compute_portwatch_metrics(events7, CFG)
+    stable_start = min(events7["event_date"].min(), episodes["event_date"].min()) - pd.Timedelta(days=CFG.stable_baseline_days + 10)
+    stable_panel = build_stablecoin_market_panel(CFG, stable_start, CFG.effective_data_end_date)
+    pegvol_ep = build_stablecoin_peg_volume_table(episodes, stable_panel, CFG)
+    pegvol7 = build_stablecoin_peg_volume_table(events7, stable_panel, CFG)
+
+    exposure_ep = summarize_pre_event_objective_metrics(episodes, loaded_assets, price_panel, cm_panel, artemis_panel, CFG)
+    exposure_ev7 = summarize_pre_event_objective_metrics(events7, loaded_assets, price_panel, cm_panel, artemis_panel, CFG)
+    exposure_ep = augment_exposure_with_defillama_stable_metrics(exposure_ep, price_panel, defillama_panel, CFG)
+    exposure_ev7 = augment_exposure_with_defillama_stable_metrics(exposure_ev7, price_panel, defillama_panel, CFG)
+    exposure_ep = add_rank_based_exposures(exposure_ep)
+    exposure_ev7 = add_rank_based_exposures(exposure_ev7)
+    cov_ep, source_ep = build_objective_coverage_summary(exposure_ep)
+
+    compact_print_df("1A) Source coverage", source_coverage_brief(cov_ep, source_ep, loaded_assets, cm_panel, defillama_panel, artemis_panel), max_rows=20)
+    compact_print_df("1B) USDC/USD and USDT/USD peg diagnostics: main episodes", peg_table_brief(pegvol_ep), max_rows=10, digits=6)
+    compact_print_df("1C) USDC/USD and USDT/USD peg diagnostics: seven-event design", peg_table_brief(pegvol7), max_rows=10, digits=6)
+    if set(loaded_assets) != set(ASSET_UNIVERSE):
+        print(f"Missing CoinGecko assets: {sorted(set(ASSET_UNIVERSE) - set(loaded_assets))}")
+
+    ep_panel = build_event_asset_panel(episodes, loaded_assets, price_panel, exposure_ep, CFG)
+    ev7_panel = build_event_asset_panel(events7, loaded_assets, price_panel, exposure_ev7, CFG)
+
+    print_section("2) Core regressions")
+    ep_results = run_objective_specs(ep_panel, "EPISODE_MAIN")
+    ev7_results = run_objective_specs(ev7_panel, "EVENT7_ROBUST")
+    compact_print_df("2A) Main two-episode metric comparison", metric_brief(ep_results), max_rows=12)
+    compact_print_df("2B) Seven-event robustness metric comparison", metric_brief(ev7_results), max_rows=12)
+
+    print_section("3) Key mechanism and influence diagnostics")
+    interactions = run_interaction_specs(ev7_panel, portwatch7, pegvol7)
+    compact_print_df("3A) Event-level mechanism interactions, seven-event design", interactions, columns=["model_name", "term", "coef", "std_err", "p_value", "n_obs", "n_events", "n_assets"], max_rows=12)
+    loo_ep = run_leave_one_asset(ep_panel, "EPISODE_MAIN", "objective_primary_z")
+    loo_ev = run_leave_one_asset(ev7_panel, "EVENT7_ROBUST", "objective_primary_z")
+    compact_print_df("3B) Most influential leave-one-asset checks: main episodes", loo_ep.head(8) if not loo_ep.empty else loo_ep, columns=["dropped_asset", "coef", "p_value", "baseline_coef", "coef_change", "n_obs"], max_rows=8)
+    compact_print_df("3C) Most influential leave-one-asset checks: seven events", loo_ev.head(8) if not loo_ev.empty else loo_ev, columns=["dropped_asset", "coef", "p_value", "baseline_coef", "coef_change", "n_obs"], max_rows=8)
+
+    print_section("4) Critical robustness checks")
+    flags = pd.concat([compact_conclusion_flags(ep_results, "EPISODE_MAIN"), compact_conclusion_flags(ev7_results, "EVENT7_ROBUST")], ignore_index=True)
+    compact_print_df("4A) Compact conclusion flags", flags, max_rows=12)
+
+    rank_excl_ep = run_rank_and_exclusion_robustness(ep_panel, "EPISODE_MAIN")
+    rank_excl_ev7 = run_rank_and_exclusion_robustness(ev7_panel, "EVENT7_ROBUST")
+    compact_print_df("4B) Main episodes: rank/no-L2/top-turnover checks", key_robustness_brief(rank_excl_ep), max_rows=12)
+    compact_print_df("4C) Seven events: rank/no-L2/top-turnover checks", key_robustness_brief(rank_excl_ev7), max_rows=12)
+
+    _, alt_results_ep = run_alternative_window_robustness(episodes, loaded_assets, price_panel, cm_panel, artemis_panel, defillama_panel, CFG, "ALT_WINDOW_EPISODE")
+    _, alt_results_ev7 = run_alternative_window_robustness(events7, loaded_assets, price_panel, cm_panel, artemis_panel, defillama_panel, CFG, "ALT_WINDOW_EVENT7")
+    compact_print_df("4D) Alternative CAR-window robustness: main episodes", alt_window_brief(alt_results_ep), max_rows=8)
+    compact_print_df("4E) Alternative CAR-window robustness: seven events", alt_window_brief(alt_results_ev7), max_rows=8)
+
+    # Placebo timing should benchmark the seven-event robustness design, not the
+    # concatenated table of seven events plus two episode-level aggregates. Using
+    # all_events here would create 9 pseudo-events per simulation and make the
+    # placebo n_events diagnostic inconsistent with the seven-event design.
+    placebo_events, placebo_panel, placebo_pooled, placebo_distribution, placebo_diag = run_placebo_timing_tests(events7, loaded_assets, price_panel, cm_panel, artemis_panel, defillama_panel, CFG)
+    compact_print_df("4F) Placebo timing tests", placebo_brief(placebo_pooled), max_rows=10)
+    compact_print_df("4G) Placebo diagnostics", placebo_diag, max_rows=12)
+    if placebo_distribution is not None and not placebo_distribution.empty:
+        psummary = placebo_distribution.describe(include="all").transpose().reset_index().rename(columns={"index": "variable"})
+        compact_print_df("4H) Placebo coefficient distribution summary", psummary, max_rows=20)
+
+    print_section("5) Automatically downloaded macro controls")
+    macro_panel, macro_download_diagnostics = download_macro_controls(CFG, data_start, data_end, price_panel=price_panel)
+    compact_print_df("5A) Macro download diagnostics", macro_brief(macro_download_diagnostics), max_rows=12)
+    macro_events7 = build_event_macro_controls(events7, macro_panel)
+    compact_print_df("5B) Event-level macro-control availability", macro_events7, max_rows=10)
+    macro_interactions = run_macro_interaction_specs(ev7_panel, macro_events7, "EVENT7_ROBUST")
+    compact_print_df("5C) Macro interaction robustness", macro_interactions, columns=["model_name", "term", "coef", "std_err", "p_value", "n_obs", "n_events", "n_assets"], max_rows=20)
+
+    print_section("6) Paper-writing warning flags")
+    compact_print_df("6A) What to state carefully in the paper", warning_flags(cov_ep, ep_results, ev7_results, rank_excl_ep, rank_excl_ev7, macro_download_diagnostics, placebo_pooled), max_rows=20)
+
+    print_section("完成")
+    print("No CSV files were written. All requested daily event-window outputs were printed to the terminal only.")
+    print("Interpretation guide:")
+    print("1) TURNOVER = CoinGecko exchange volume / market cap; tradability/attention, not payment flow.")
+    print("2) SETTLE_capacity = DefiLlama chain stablecoin supply / native token market cap; capacity proxy, not transfer flow.")
+    print("3) HYBRID = mapped-sample composite only: assets without settlement-capacity data are excluded from hybrid regressions.")
+    print("4) Significant OLS but insignificant WLS means equal-weighted cross-sectional evidence, not liquidity-weighted portfolio evidence.")
+    print("5) If no-L2 turnover weakens, write this as a limitation: L2 assets are economically important contributors.")
+    print("6) Only report external macro controls that successfully downloaded in the macro diagnostics table.")
+
+if __name__ == "__main__":
+    main()
