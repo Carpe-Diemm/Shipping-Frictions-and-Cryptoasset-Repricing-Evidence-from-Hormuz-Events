@@ -19,7 +19,8 @@ Major design notes:
 5) Terminal output is compact and prints only decision-relevant results.
 6) No hourly-price module is included; all CARs are based on daily event windows.
 
-
+Important: this script contains a CoinGecko key previously provided by the user. Do not upload publicly.
+"""
 
 from __future__ import annotations
 
@@ -83,8 +84,8 @@ pd.options.display.max_rows = 220
 @dataclass
 class Config:
     start_date: datetime = field(default_factory=lambda: datetime(2025, 4, 22, tzinfo=timezone.utc))
-    end_date: datetime = field(default_factory=lambda: datetime(2026, 4, 22, tzinfo=timezone.utc))
-    effective_data_end_date: datetime = field(default_factory=lambda: datetime(2026, 4, 19, tzinfo=timezone.utc))
+    end_date: datetime = field(default_factory=lambda: datetime(2026, 5, 17, tzinfo=timezone.utc))
+    effective_data_end_date: datetime = field(default_factory=lambda: datetime(2026, 5, 17, tzinfo=timezone.utc))
 
     # Hardcoded CoinGecko API key for local use. Do not upload this file publicly.
     coingecko_api_key: str = "CG-pKjF1WzP8j2AVSAtqEqV68C7"
@@ -96,6 +97,9 @@ class Config:
 
     cache_dir: str = "research_cache_objective_episode"
     output_dir: str = "hormuz_objective_episode_outputs"
+    data_export_dir: str = r"C:\Users\11372\Desktop\加密事件分析"
+    raw_data_workbook_name: str = "hormuz_raw_source_data.xlsx"
+    results_workbook_name: str = "hormuz_run_results.xlsx"
     verbose_download_logs: bool = False
     write_csv_outputs: bool = False
     sleep_sec: float = 0.35
@@ -291,7 +295,7 @@ FIXED_HORMUZ_EVENTS = [
     {"event_id": "E004", "event_date": "2026-04-09", "event_type": "threat", "event_weight": 1.0, "event_name": "IMO says toll for using Hormuz would be a dangerous precedent", "car_post_days": 5, "portwatch_window_days": 3, "stable_window_days": 7, "peg_window_days": 3},
     {"event_id": "E005", "event_date": "2026-04-10", "event_type": "de_escalation", "event_weight": 0.5, "event_name": "Trump says Strait of Hormuz will be open fairly soon", "car_post_days": 5, "portwatch_window_days": 3, "stable_window_days": 7, "peg_window_days": 3},
     {"event_id": "E006", "event_date": "2026-04-13", "event_type": "act_escalation", "event_weight": 1.5, "event_name": "Failed talks followed by U.S. blockade escalation", "car_post_days": 5, "portwatch_window_days": 3, "stable_window_days": 7, "peg_window_days": 3},
-    {"event_id": "E007", "event_date": "2026-04-17", "event_type": "de_escalation", "event_weight": 0.5, "event_name": "Iran says Hormuz open during ceasefire; ships test passage", "car_post_days": 2, "portwatch_window_days": 2, "stable_window_days": 2, "peg_window_days": 2},
+    {"event_id": "E007", "event_date": "2026-04-17", "event_type": "de_escalation", "event_weight": 0.5, "event_name": "Iran says Hormuz open during ceasefire; ships test passage", "car_post_days": 5, "portwatch_window_days": 3, "stable_window_days": 7, "peg_window_days": 3},
 ]
 
 EPISODES = [
@@ -2556,6 +2560,148 @@ def warning_flags(cov_ep: pd.DataFrame, ep_results: pd.DataFrame, ev7_results: p
     add("placebo timing", "available" if placebo_pooled is not None and not placebo_pooled.empty else "empty", "Only report placebo if this table is non-empty.")
     return pd.DataFrame(rows)
 
+
+# =========================================================
+# Excel export helpers
+# =========================================================
+
+def _safe_excel_sheet_name(name: str, used: Optional[set] = None) -> str:
+    """Create a valid, unique Excel sheet name with <=31 characters."""
+    used = used if used is not None else set()
+    invalid = set('[]:*?/\\')
+    cleaned = ''.join('_' if ch in invalid else ch for ch in str(name)).strip()
+    cleaned = cleaned[:31] if cleaned else "Sheet"
+    base = cleaned
+    i = 1
+    while cleaned in used:
+        suffix = f"_{i}"
+        cleaned = (base[:31-len(suffix)] + suffix) if len(base) + len(suffix) > 31 else base + suffix
+        i += 1
+    used.add(cleaned)
+    return cleaned
+
+
+def _make_excel_exportable(obj: Any) -> pd.DataFrame:
+    """Convert an object to an Excel-safe DataFrame."""
+    if obj is None:
+        out = pd.DataFrame()
+    elif isinstance(obj, pd.DataFrame):
+        out = obj.copy()
+    elif isinstance(obj, pd.Series):
+        out = obj.reset_index()
+    else:
+        try:
+            out = pd.DataFrame(obj)
+        except Exception:
+            out = pd.DataFrame({"value": [str(obj)]})
+
+    for col in out.columns:
+        try:
+            if pd.api.types.is_datetime64tz_dtype(out[col]):
+                out[col] = out[col].dt.tz_convert("UTC").dt.tz_localize(None)
+            elif pd.api.types.is_datetime64_any_dtype(out[col]):
+                out[col] = pd.to_datetime(out[col], errors="coerce")
+            elif out[col].dtype == "object":
+                out[col] = out[col].map(
+                    lambda x: x.tz_convert("UTC").tz_localize(None).isoformat() if isinstance(x, pd.Timestamp) and x.tzinfo is not None else
+                    (x.isoformat() if isinstance(x, (pd.Timestamp, datetime)) else
+                     (json.dumps(x, ensure_ascii=False, default=str) if isinstance(x, (list, dict, tuple)) else x))
+                )
+        except Exception:
+            out[col] = out[col].astype(str)
+    return out
+
+
+def _config_to_export_dataframe(cfg: Config) -> pd.DataFrame:
+    """Export configuration without exposing API credentials."""
+    rows = []
+    for k, v in cfg.__dict__.items():
+        if "key" in k.lower() or "token" in k.lower() or "secret" in k.lower():
+            val = "[REDACTED]" if str(v).strip() else ""
+        elif isinstance(v, datetime):
+            val = v.isoformat()
+        elif isinstance(v, (list, dict, tuple)):
+            val = json.dumps(v, ensure_ascii=False, default=str)
+        else:
+            val = v
+        rows.append({"parameter": k, "value": val})
+    return pd.DataFrame(rows)
+
+
+def _asset_master_to_export_dataframe() -> pd.DataFrame:
+    rows = []
+    for symbol, meta in ASSET_MASTER.items():
+        row = {"symbol": symbol}
+        row.update(meta)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _defillama_chain_mapping_to_export_dataframe() -> pd.DataFrame:
+    return pd.DataFrame([{"symbol": symbol, "defillama_chain": chain} for symbol, chain in DEFI_LLAMA_CHAIN_MAP.items()])
+
+
+def load_portwatch_raw_inputs(cfg: Config) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Load raw PortWatch arrivals and volume CSV files for the raw-data workbook."""
+    arr_path = resolve_existing_file(cfg.portwatch_arrivals_candidates, "PortWatch arrivals")
+    vol_path = resolve_existing_file(cfg.portwatch_volume_candidates, "PortWatch volume")
+    arrivals_raw = pd.DataFrame()
+    volume_raw = pd.DataFrame()
+    if arr_path:
+        arrivals_raw = load_portwatch_csv(arr_path, "arrivals_raw")
+        arrivals_raw["source_file"] = arr_path
+    if vol_path:
+        volume_raw = load_portwatch_csv(vol_path, "volume_raw")
+        volume_raw["source_file"] = vol_path
+    return arrivals_raw, volume_raw
+
+
+def _write_excel_workbook(workbook_path: Path, sheets: Dict[str, Any]) -> str:
+    """Write a dictionary of DataFrames to an Excel workbook, one sheet per item."""
+    ensure_package("openpyxl", "openpyxl")
+    workbook_path.parent.mkdir(parents=True, exist_ok=True)
+    used = set()
+    prepared = {}
+    metadata_rows = []
+    excel_limit = 1048575  # Excel row limit minus header row
+
+    for original_name, obj in sheets.items():
+        sheet_name = _safe_excel_sheet_name(original_name, used)
+        df = _make_excel_exportable(obj)
+        truncated = False
+        if len(df) > excel_limit:
+            df = df.head(excel_limit).copy()
+            truncated = True
+        prepared[sheet_name] = df
+        metadata_rows.append({
+            "data_category": original_name,
+            "excel_sheet": sheet_name,
+            "rows": int(len(df)),
+            "columns": int(len(df.columns)),
+            "truncated_to_excel_limit": truncated,
+        })
+
+    metadata = pd.DataFrame(metadata_rows)
+    # Reserve first sheet for workbook metadata.
+    final_sheets = {"00_export_metadata": metadata}
+    final_sheets.update(prepared)
+
+    with pd.ExcelWriter(workbook_path, engine="openpyxl") as writer:
+        for sheet_name, df in final_sheets.items():
+            safe_sheet = _safe_excel_sheet_name(sheet_name, used) if sheet_name not in prepared else sheet_name
+            _make_excel_exportable(df).to_excel(writer, sheet_name=safe_sheet, index=False)
+    return str(workbook_path)
+
+
+def export_study_excel_workbooks(raw_sheets: Dict[str, Any], result_sheets: Dict[str, Any], cfg: Config) -> Dict[str, str]:
+    """Export raw source data and run results as two separate Excel workbooks."""
+    export_dir = Path(getattr(cfg, "data_export_dir", cfg.output_dir)).expanduser()
+    raw_path = export_dir / getattr(cfg, "raw_data_workbook_name", "hormuz_raw_source_data.xlsx")
+    results_path = export_dir / getattr(cfg, "results_workbook_name", "hormuz_run_results.xlsx")
+    raw_file = _write_excel_workbook(raw_path, raw_sheets)
+    results_file = _write_excel_workbook(results_path, result_sheets)
+    return {"raw_data_excel": raw_file, "results_excel": results_file}
+
 # =========================================================
 # Main
 # =========================================================
@@ -2564,7 +2710,8 @@ def main():
     print_section("0) Compact terminal run: daily Hormuz objective episode study")
     print(f"Study window: {CFG.start_date.date()} -> {CFG.end_date.date()}; effective data end: {CFG.effective_data_end_date.date()}")
     print(f"Assets: {len(ASSET_UNIVERSE)} non-stable cryptoassets. Main design: 2 episodes. Robustness design: 7 events.")
-    print("Daily-only terminal output is compact. CSV export is disabled. Set CFG.verbose_download_logs=True only for debugging downloads.")
+    print(f"Daily-only terminal output is compact. Excel export is enabled to: {CFG.data_export_dir}")
+    print("Set CFG.verbose_download_logs=True only for debugging downloads.")
 
     events7 = build_events(FIXED_HORMUZ_EVENTS, CFG)
     episodes = build_events(EPISODES, CFG)
@@ -2580,6 +2727,8 @@ def main():
     defillama_panel = build_defillama_chain_stablecoin_panel(loaded_assets, CFG)
 
     portwatch7 = compute_portwatch_metrics(events7, CFG)
+    portwatch_ep = compute_portwatch_metrics(episodes, CFG)
+    portwatch_arrivals_raw, portwatch_volume_raw = load_portwatch_raw_inputs(CFG)
     stable_start = min(events7["event_date"].min(), episodes["event_date"].min()) - pd.Timedelta(days=CFG.stable_baseline_days + 10)
     stable_panel = build_stablecoin_market_panel(CFG, stable_start, CFG.effective_data_end_date)
     pegvol_ep = build_stablecoin_peg_volume_table(episodes, stable_panel, CFG)
@@ -2625,8 +2774,8 @@ def main():
     compact_print_df("4B) Main episodes: rank/no-L2/top-turnover checks", key_robustness_brief(rank_excl_ep), max_rows=12)
     compact_print_df("4C) Seven events: rank/no-L2/top-turnover checks", key_robustness_brief(rank_excl_ev7), max_rows=12)
 
-    _, alt_results_ep = run_alternative_window_robustness(episodes, loaded_assets, price_panel, cm_panel, artemis_panel, defillama_panel, CFG, "ALT_WINDOW_EPISODE")
-    _, alt_results_ev7 = run_alternative_window_robustness(events7, loaded_assets, price_panel, cm_panel, artemis_panel, defillama_panel, CFG, "ALT_WINDOW_EVENT7")
+    alt_panel_ep, alt_results_ep = run_alternative_window_robustness(episodes, loaded_assets, price_panel, cm_panel, artemis_panel, defillama_panel, CFG, "ALT_WINDOW_EPISODE")
+    alt_panel_ev7, alt_results_ev7 = run_alternative_window_robustness(events7, loaded_assets, price_panel, cm_panel, artemis_panel, defillama_panel, CFG, "ALT_WINDOW_EVENT7")
     compact_print_df("4D) Alternative CAR-window robustness: main episodes", alt_window_brief(alt_results_ep), max_rows=8)
     compact_print_df("4E) Alternative CAR-window robustness: seven events", alt_window_brief(alt_results_ev7), max_rows=8)
 
@@ -2650,10 +2799,64 @@ def main():
     compact_print_df("5C) Macro interaction robustness", macro_interactions, columns=["model_name", "term", "coef", "std_err", "p_value", "n_obs", "n_events", "n_assets"], max_rows=20)
 
     print_section("6) Paper-writing warning flags")
-    compact_print_df("6A) What to state carefully in the paper", warning_flags(cov_ep, ep_results, ev7_results, rank_excl_ep, rank_excl_ev7, macro_download_diagnostics, placebo_pooled), max_rows=20)
+    warnings_table = warning_flags(cov_ep, ep_results, ev7_results, rank_excl_ep, rank_excl_ev7, macro_download_diagnostics, placebo_pooled)
+    compact_print_df("6A) What to state carefully in the paper", warnings_table, max_rows=20)
+
+    print_section("7) Export Excel workbooks")
+    export_paths = export_study_excel_workbooks({
+        "config": _config_to_export_dataframe(CFG),
+        "asset_universe": _asset_master_to_export_dataframe(),
+        "defillama_chain_mapping": _defillama_chain_mapping_to_export_dataframe(),
+        "events_7event_design": events7,
+        "events_episode_design": episodes,
+        "coingecko_crypto_price_marketcap_volume_returns": price_panel,
+        "coingecko_stablecoin_price_marketcap_volume": stable_panel,
+        "coinmetrics_onchain_panel": cm_panel,
+        "artemis_p2p_stablecoin_panel": artemis_panel,
+        "defillama_chain_stablecoin_supply": defillama_panel,
+        "portwatch_raw_arrivals": portwatch_arrivals_raw,
+        "portwatch_raw_volume": portwatch_volume_raw,
+        "macro_daily_controls": macro_panel,
+        "macro_download_diagnostics": macro_download_diagnostics,
+    }, {
+        "portwatch_metrics_7events": portwatch7,
+        "portwatch_metrics_episodes": portwatch_ep,
+        "stablecoin_peg_volume_episodes": pegvol_ep,
+        "stablecoin_peg_volume_7events": pegvol7,
+        "exposure_variables_episodes": exposure_ep,
+        "exposure_variables_7events": exposure_ev7,
+        "event_asset_panel_episodes": ep_panel,
+        "event_asset_panel_7events": ev7_panel,
+        "coverage_summary_episodes": cov_ep,
+        "objective_source_mix_episodes": source_ep,
+        "regression_results_episodes": ep_results,
+        "regression_results_7events": ev7_results,
+        "metric_comparison_episodes": metric_brief(ep_results),
+        "metric_comparison_7events": metric_brief(ev7_results),
+        "mechanism_interactions_7events": interactions,
+        "leave_one_asset_episodes": loo_ep,
+        "leave_one_asset_7events": loo_ev,
+        "conclusion_flags": flags,
+        "rank_exclusion_robustness_episodes": rank_excl_ep,
+        "rank_exclusion_robustness_7events": rank_excl_ev7,
+        "alternative_window_panel_episodes": alt_panel_ep,
+        "alternative_window_panel_7events": alt_panel_ev7,
+        "alternative_window_results_episodes": alt_results_ep,
+        "alternative_window_results_7events": alt_results_ev7,
+        "placebo_events": placebo_events,
+        "placebo_panel_brief": placebo_panel,
+        "placebo_summary": placebo_pooled,
+        "placebo_distribution": placebo_distribution,
+        "placebo_diagnostics": placebo_diag,
+        "macro_event_controls_7events": macro_events7,
+        "macro_interaction_results": macro_interactions,
+        "paper_writing_warning_flags": warnings_table,
+    }, CFG)
+    for key, value in export_paths.items():
+        print(f"{key}: {value}")
 
     print_section("完成")
-    print("No CSV files were written. All requested daily event-window outputs were printed to the terminal only.")
+    print("Raw source data and run results were written to two Excel workbooks. No CSV files were written.")
     print("Interpretation guide:")
     print("1) TURNOVER = CoinGecko exchange volume / market cap; tradability/attention, not payment flow.")
     print("2) SETTLE_capacity = DefiLlama chain stablecoin supply / native token market cap; capacity proxy, not transfer flow.")
